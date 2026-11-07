@@ -1008,7 +1008,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             ProcessInfo.processInfo.arguments.contains("--rc003-voice-extension-test") ||
             (Bundle.main.object(forInfoDictionaryKey: "RC003VoiceExtensionTestEnabled") as? Bool == true),
         recordingAssetStore: RecordingAssetStore = RecordingAssetStore(),
-        diagnosticLogUploader: DiagnosticLogUploader = .shared
+        diagnosticLogUploader: DiagnosticLogUploader = .shared,
+        makeButtonInteractionController: @escaping () -> RemoteButtonInteractionController = {
+            RemoteButtonInteractionController()
+        }
     ) {
         self.settings = settings
         self.chromecastFeature = chromecastFeature
@@ -1020,6 +1023,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         self.rc003VoiceExtensionTestEnabled = rc003VoiceExtensionTestEnabled
         self.recordingAssetStore = recordingAssetStore
         self.diagnosticLogUploader = diagnosticLogUploader
+        self.makeButtonInteractionController = makeButtonInteractionController
         super.init()
         if settings.siriRemoteEnabled, settings.siriRemoteNeedsUserAction {
             siriRemoteAudioStatus = "unavailable:authorization_user_action_required"
@@ -1043,6 +1047,16 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     "operation_id=\(self?.appleRemoteAppSwitcherOperationLabel ?? "none") " +
                     message
             )
+        }
+        settings.onCustomMappingDisabled = { [weak self] in
+            guard let self else { return }
+            self.cancelConfiguredButtonInteractions(reason: "mapping_disabled")
+            // nil is the unprofiled owner, not a wildcard. Clear every source,
+            // including a held device that is no longer selected or registered.
+            self.cancelButtonMappingInteractions(device: nil, reason: "mapping_disabled")
+            for profile in self.settings.remoteDeviceProfiles {
+                self.cancelButtonMappingInteractions(device: profile.id, reason: "mapping_disabled")
+            }
         }
         settings.onInteractionModeChanged = { [weak self] device in
             self?.cancelButtonMappingInteractions(device: device)
@@ -3654,6 +3668,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     // A controller per physical or companion source keeps simultaneous holds isolated.
     private var configuredButtonInteractions: [String: RemoteButtonInteractionController] = [:]
     private var configuredButtonInteractionOwners: [String: UUID] = [:]
+    private let makeButtonInteractionController: () -> RemoteButtonInteractionController
 
     private func buttonInteractionSnapshot(_ button: RemoteButton, profileID: UUID?) -> RemoteButtonInteractionSnapshot {
         settings.interactionSnapshot(for: button, profileID: profileID) { [self] trigger in
@@ -3665,9 +3680,6 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private func handleConfiguredButtonInteraction(_ phase: RemoteButtonPhase, button: RemoteButton,
         profileID: UUID?, source: String,
         perform: @escaping (ButtonTrigger, ConfiguredButtonAction) -> Bool) {
-        let controller = configuredButtonInteractions[source] ?? RemoteButtonInteractionController()
-        configuredButtonInteractions[source] = controller
-        configuredButtonInteractionOwners[source] = profileID
         let bindingSnapshot = buttonInteractionSnapshot(button, profileID: profileID)
         var snapshot = bindingSnapshot
         if (source.hasPrefix("mobile:") || source == "watch"),
@@ -3682,12 +3694,31 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         let requiresAccessibility = [snapshot.single, snapshot.double, snapshot.long].contains {
                 !$0.action.isAppInternal && $0.action != .disabled
             }
-        controller.handle(phase, button: button, snapshot: snapshot,
-            valid: { [weak self] in
+        routeConfiguredButtonInteraction(phase, button: button, profileID: profileID,
+            source: source, snapshot: snapshot, contextIsValid: { [weak self] in
                 guard let self else { return false }
                 return (!requiresAccessibility || KeyboardInjector.isAccessibilityTrusted) && !self.macroFeature.isEditorActive &&
                     NSWorkspace.shared.frontmostApplication?.processIdentifier == target &&
                     bindingSnapshot.hasSameBinding(as: self.buttonInteractionSnapshot(button, profileID: profileID))
+            }, perform: perform)
+    }
+
+    /// Shared host routing keeps controller ownership and cancellation identical
+    /// for each hardware source; contextual checks stay with the caller.
+    func routeConfiguredButtonInteraction(_ phase: RemoteButtonPhase, button: RemoteButton,
+        profileID: UUID?, source: String, snapshot: RemoteButtonInteractionSnapshot,
+        contextIsValid: @escaping () -> Bool,
+        perform: @escaping (ButtonTrigger, ConfiguredButtonAction) -> Bool) {
+        guard settings.customMappingEnabled else {
+            cancelConfiguredButtonInteractions(source: source, reason: "mapping_disabled")
+            return
+        }
+        let controller = configuredButtonInteractions[source] ?? makeButtonInteractionController()
+        configuredButtonInteractions[source] = controller
+        configuredButtonInteractionOwners[source] = profileID
+        controller.handle(phase, button: button, snapshot: snapshot,
+            valid: { [weak self] in
+                self?.settings.customMappingEnabled == true && contextIsValid()
             }, perform: perform)
     }
 
@@ -9385,6 +9416,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
         guard settings.customMappingEnabled || suppressConfiguredAction else {
             // 与小米/苹果遥控器同一规则：映射总开关关闭时按键由系统消费，宿主不接管。
+            // A late release must only clear captured state, never execute a
+            // pending single/double action after the switch has been disabled.
+            resetChromecastButtonState(reason: "mapping_disabled")
             if event.phase == .began {
                 AppLogger.shared.write(
                     "CHROMECAST ACTION phase=completed result=system_managed control=\(controlID)"
