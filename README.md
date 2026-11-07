@@ -1,4 +1,36 @@
-# 无线麦 SayAll
+# 无线麦 SayAll：G9N9N 本机适配
+
+
+> 本仓库是基于 [HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app) 的独立公开派生版本，基线为 `a29dad82de72fc56f0d1b7fde64fb00bdb0f083e`。保留上游 GPL-3.0 许可证与版权说明。
+
+本分支汇总 macOS 上的 G9N9N 公开适配：按住语音、虚拟麦克风、HCI 普通按键、会话收尾与异常恢复、系统唤醒恢复及安装测试隔离。语音识别使用用户自行配置的输入工具。
+
+本地安装沿原入口，需提供自己的稳定本地开发签名：
+
+```sh
+SAYALL_LOCAL_PUBLIC=1 SAYALL_LOCAL_SIGNING_IDENTITY='<本地开发签名标识>' scripts/package-local-test-app.sh
+```
+
+本地包通过合入上游源码、执行回归并重新打包更新，保留用户设置与构建号。该包不会自动替换为上游通用安装包。源码与验证状态见 [G9N9N验收手册](Testing/G9N9NRemote.md)；真实睡眠、无线异常及其他遥控器型号的未验边界仍保留。
+
+此仓库为保留隐私而以公开快照初始化，和原上游不共享完整提交历史。后续更新在当前本机适配分支新建同步分支，按上面记录的上游基线重放差异，处理冲突并回归后再打包：
+
+```sh
+# 首次克隆时添加；本地已存在 upstream 时略过这一行
+git remote add upstream https://github.com/HD838A/remote-mic-app.git
+git fetch --ipv4 upstream main
+git switch -c sync/upstream-update feat/g9n9n-local
+git diff --binary a29dad82de72fc56f0d1b7fde64fb00bdb0f083e upstream/main > /tmp/sayall-upstream.patch
+git apply --3way /tmp/sayall-upstream.patch
+```
+
+若有冲突，保留适配语义并解决后测试；验证完成时同步记录新的上游基线。此更新路径不重写既有历史，也不把私有平台的版本清单当作已取得私有实现。
+
+建议的编码办公绑定：方向键移动、确定回车、返回Esc、主页切换上一个应用、信源切换中英文；YouTube复制、Netflix粘贴、电源保存，音量与静音控制系统，语音键按住说话。自定义绑定保存在本机，不含个人配置的导出文件。
+
+以下保留上游项目介绍及链接；各平台功能与发行版能力应以相应项目为准。
+
+---
 
 [English](README.en.md)
 

@@ -61,17 +61,26 @@ struct UpdateFeedSelection {
 
 struct UpdateCheckPolicy: Equatable {
     let checksForPreReleaseUpdates: Bool
+    let isLocalPublicBuild: Bool
+
+    init(checksForPreReleaseUpdates: Bool,
+         isLocalPublicBuild: Bool = Bundle.main.object(forInfoDictionaryKey: "SayAllPublicG9N9N") as? Bool == true) {
+        self.checksForPreReleaseUpdates = checksForPreReleaseUpdates
+        self.isLocalPublicBuild = isLocalPublicBuild
+    }
+
+    var allowsUpstreamUpdates: Bool { !isLocalPublicBuild }
 
     var startsUpdaterAutomatically: Bool {
-        !checksForPreReleaseUpdates
+        allowsUpstreamUpdates && !checksForPreReleaseUpdates
     }
 
     var allowsBackgroundUpdatePrompts: Bool {
-        !checksForPreReleaseUpdates
+        allowsUpstreamUpdates && !checksForPreReleaseUpdates
     }
 
     var refreshesAboutInformationOnAppear: Bool {
-        !checksForPreReleaseUpdates
+        allowsUpstreamUpdates && !checksForPreReleaseUpdates
     }
 }
 
@@ -378,6 +387,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        AppLogger.shared.write("APP LIFECYCLE phase=terminating reason=appkit_callback")
         model.privateFeature.hideHUDImmediately()
         model.stop()
         model.settings.discardOnboardingVoiceTrial()
@@ -453,6 +463,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 queue: .main
             )
             source.setEventHandler {
+                AppLogger.shared.write("APP LIFECYCLE phase=termination_requested reason=signal signal=\(signalNumber == SIGTERM ? "sigterm" : "sigint")")
                 NSApp.terminate(nil)
             }
             source.resume()
@@ -1057,6 +1068,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func startUpdaterIfNeeded() {
+        guard UpdateCheckPolicy(checksForPreReleaseUpdates: model.settings.checksForPreReleaseUpdates).allowsUpstreamUpdates else { return }
         guard !updaterStarted else { return }
         updaterController.updater.automaticallyChecksForUpdates =
             UpdateCheckPolicy(
@@ -1325,6 +1337,17 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func performUpdateCheck(_ purpose: UpdateCheckPurpose) {
+        guard UpdateCheckPolicy(checksForPreReleaseUpdates: model.settings.checksForPreReleaseUpdates).allowsUpstreamUpdates else {
+            AppLogger.shared.write("UPDATE CHECK phase=skipped reason=local_public_build manual_update_required=true")
+            if case .userInitiated = purpose {
+                let alert = NSAlert()
+                alert.messageText = localization.text("about.version.local_build_title")
+                alert.informativeText = localization.text("about.version.local_build_description")
+                alert.addButton(withTitle: localization.text("common.action.ok"))
+                alert.runModal()
+            }
+            return
+        }
         updateCheckTask?.cancel()
         updateCheckTask = Task { [weak self] in
             guard let self else { return }
@@ -1504,6 +1527,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func quit() {
+        AppLogger.shared.write("APP LIFECYCLE phase=termination_requested reason=user_quit")
         NSApp.terminate(nil)
     }
 }

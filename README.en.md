@@ -1,3 +1,5 @@
+> This is an independent public derivative of [HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app), based on `a29dad82de72fc56f0d1b7fde64fb00bdb0f083e`, with the upstream GPL-3.0 license and notices retained. This branch focuses on public G9N9N support on macOS. Local public builds are updated by rebuilding source, preserving the adaptation and local settings. See the [G9N9N validation guide](Testing/G9N9NRemote.md). The history starts from a clean public snapshot. Apply the upstream diff from the recorded baseline on a separate synchronization branch, resolve conflicts and test before rebuilding; see the commands in the Chinese README. Update the recorded baseline after validation. The upstream project information below is retained for attribution.
+
 # SayAll
 
 [简体中文](README.md)
