@@ -5,8 +5,10 @@ import XPC
 
 /// Tracks a native authorization reply; this never grants or relaxes any right.
 struct PacketLoggerAuthorizationWait {
+    static let serverAcceptanceDeadline: TimeInterval = 30
     let applicationDeadline: TimeInterval?
     private var awaitingReply = false
+    private var awaitingAcceptance = false
 
     init(requiresPreparedRule: Bool) {
         // The prepared flow uses native interactive administrator approval.
@@ -15,16 +17,24 @@ struct PacketLoggerAuthorizationWait {
         applicationDeadline = requiresPreparedRule ? nil : 30
     }
 
-    mutating func begin() { awaitingReply = true }
-    mutating func cancel() { awaitingReply = false }
+    mutating func begin() { awaitingReply = true; awaitingAcceptance = false }
+    mutating func cancel() { awaitingReply = false; awaitingAcceptance = false }
     mutating func complete() -> Bool {
         guard awaitingReply else { return false }
         awaitingReply = false
+        awaitingAcceptance = true
         return true
     }
+    mutating func serverAccepted() { cancel() }
     mutating func expire(after elapsed: TimeInterval) -> Bool {
-        guard awaitingReply, let applicationDeadline, elapsed >= applicationDeadline else { return false }
-        awaitingReply = false
+        guard awaitingReply || awaitingAcceptance, let applicationDeadline,
+              elapsed >= applicationDeadline else { return false }
+        cancel()
+        return true
+    }
+    mutating func expireServerAcceptance(after elapsed: TimeInterval) -> Bool {
+        guard awaitingAcceptance, elapsed >= Self.serverAcceptanceDeadline else { return false }
+        cancel()
         return true
     }
 }
@@ -75,6 +85,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
         case connectionInvalid
         case connectionTimedOut
         case authorizationTimedOut
+        case authorizationAcceptanceTimedOut
         case malformedMessage(count: Int, hasRequiresAuthorization: Bool, hasPacket: Bool)
         case malformedPacket
         case trafficLimitExceeded
@@ -96,6 +107,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
             case .connectionInvalid: return "connection_invalid"
             case .connectionTimedOut: return "connection_timed_out"
             case .authorizationTimedOut: return "authorization_timed_out"
+            case .authorizationAcceptanceTimedOut: return "authorization_acceptance_timed_out"
             case .malformedMessage(let count, let hasRequiresAuthorization, let hasPacket):
                 return "malformed_message_count_\(count)_requires_\(hasRequiresAuthorization)_packet_\(hasPacket)"
             case .malformedPacket: return "malformed_packet"
@@ -293,6 +305,12 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
         case .failed(let failure):
             fail(failure)
         case .granted(let grant):
+            let acceptanceDeadline = PacketLoggerAuthorizationWait.serverAcceptanceDeadline
+            stateQueue.asyncAfter(deadline: .now() + acceptanceDeadline) { [weak self] in
+                guard let self, self.generation == resultGeneration, self.state == .authorizing,
+                      self.authorizationWait.expireServerAcceptance(after: acceptanceDeadline) else { return }
+                self.fail(.authorizationAcceptanceTimedOut)
+            }
             authorizationProgress(.granted)
             authorization = grant.reference
             createdAuthorizationRule = grant.createdRule
@@ -483,6 +501,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
             return false
         }
         state = .streaming
+        authorizationWait.serverAccepted()
         guard !didEmitAuthorized else { return true }
         didEmitAuthorized = true
         emit(.authorized)

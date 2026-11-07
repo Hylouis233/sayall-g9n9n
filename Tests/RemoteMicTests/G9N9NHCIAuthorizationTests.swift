@@ -31,6 +31,33 @@ struct G9N9NHCIAuthorizationTests {
         #expect(!lateReply)
     }
 
+    @Test func preparedGrantStillHasBoundedServerAcceptance() {
+        var wait = PacketLoggerAuthorizationWait(requiresPreparedRule: true)
+        wait.begin()
+        let acceptedNative = wait.complete()
+        let early = wait.expireServerAcceptance(after: 29)
+        let expired = wait.expireServerAcceptance(after: 30)
+        #expect(acceptedNative && !early && expired)
+    }
+
+    @Test func legacyOverallDeadlineAlsoCoversThePostGrantPhase() {
+        var wait = PacketLoggerAuthorizationWait(requiresPreparedRule: false)
+        wait.begin()
+        let acceptedNative = wait.complete()
+        let expired = wait.expire(after: 30)
+        #expect(acceptedNative && expired)
+    }
+
+    @Test func serverAcceptanceCancelsBothWatchdogs() {
+        var wait = PacketLoggerAuthorizationWait(requiresPreparedRule: true)
+        wait.begin()
+        let acceptedNative = wait.complete()
+        wait.serverAccepted()
+        let serverExpired = wait.expireServerAcceptance(after: 60)
+        let appExpired = wait.expire(after: 600)
+        #expect(acceptedNative && !serverExpired && !appExpired)
+    }
+
     private var strong: [String: Any] {
         ["class": "user", "group": "admin", "authenticate-user": true,
          "shared": false, "timeout": 0]
