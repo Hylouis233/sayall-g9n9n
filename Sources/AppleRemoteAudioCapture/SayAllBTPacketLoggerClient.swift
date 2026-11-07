@@ -3,6 +3,32 @@ import Foundation
 import Security
 import XPC
 
+/// Tracks a native authorization reply; this never grants or relaxes any right.
+struct PacketLoggerAuthorizationWait {
+    let applicationDeadline: TimeInterval?
+    private var awaitingReply = false
+
+    init(requiresPreparedRule: Bool) {
+        // The prepared flow uses native interactive administrator approval.
+        // Keep its context until the OS replies or this client stops; a timer
+        // cannot cancel AuthorizationCopyRights and would orphan its prompt.
+        applicationDeadline = requiresPreparedRule ? nil : 30
+    }
+
+    mutating func begin() { awaitingReply = true }
+    mutating func cancel() { awaitingReply = false }
+    mutating func complete() -> Bool {
+        guard awaitingReply else { return false }
+        awaitingReply = false
+        return true
+    }
+    mutating func expire(after elapsed: TimeInterval) -> Bool {
+        guard awaitingReply, let applicationDeadline, elapsed >= applicationDeadline else { return false }
+        awaitingReply = false
+        return true
+    }
+}
+
 public enum PacketLoggerAuthorizationRulePolicy {
     public static func isStrongEnough(_ values: [String: Any]) -> Bool {
         guard values["class"] as? String == "user",
@@ -130,6 +156,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
     private var authorization: AuthorizationRef?
     private var createdAuthorizationRule = false
     private var authorizationAttempted = false
+    private var authorizationWait: PacketLoggerAuthorizationWait
     private var didEmitAuthorized = false
     private var authorizationRuleSealed = false
     private var authorizationRuleSealing = false
@@ -153,6 +180,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
         self.stateQueue = stateQueue
         self.callbackQueue = callbackQueue
         self.requiresPreparedAuthorizationRule = requiresPreparedAuthorizationRule
+        authorizationWait = PacketLoggerAuthorizationWait(requiresPreparedRule: requiresPreparedAuthorizationRule)
         self.sealsAfterServerAcceptance = sealsAfterServerAcceptance
         self.allowsPacketAsAuthorization = allowsPacketAsAuthorization
         self.sealAuthorizationRight = sealAuthorizationRight
@@ -225,29 +253,40 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
         }
         authorizationAttempted = true
         state = .authorizing
+        authorizationWait.begin()
         let requestGeneration = generation
         emit(.authorizing)
 
         let requiresPreparedRule = requiresPreparedAuthorizationRule
         authorizationProgress(.requesting)
         authorizationQueue.async { [weak self] in
+            guard self != nil else { return }
             let result = Self.performAuthorizationRequest(requiresPreparedRule: requiresPreparedRule)
-            self?.stateQueue.async { [weak self] in
-                self?.handleAuthorizationResult(result, generation: requestGeneration)
+            guard let queue = self?.stateQueue else {
+                Self.discardAuthorizationResult(result)
+                return
+            }
+            queue.async { [weak self] in
+                guard let self else {
+                    Self.discardAuthorizationResult(result)
+                    return
+                }
+                self.handleAuthorizationResult(result, generation: requestGeneration)
             }
         }
 
-        stateQueue.asyncAfter(deadline: .now() + (requiresPreparedRule ? 120 : 30)) { [weak self] in
-            guard let self, self.generation == requestGeneration, self.state == .authorizing else { return }
-            self.fail(.authorizationTimedOut)
+        if let timeout = authorizationWait.applicationDeadline {
+            stateQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self, self.generation == requestGeneration, self.state == .authorizing,
+                      self.authorizationWait.expire(after: timeout) else { return }
+                self.fail(.authorizationTimedOut)
+            }
         }
     }
 
     private func handleAuthorizationResult(_ result: AuthorizationResult, generation resultGeneration: UInt64) {
-        guard generation == resultGeneration, state == .authorizing else {
-            if case .granted(let grant) = result {
-                AuthorizationFree(grant.reference, [.destroyRights])
-            }
+        guard generation == resultGeneration, state == .authorizing, authorizationWait.complete() else {
+            Self.discardAuthorizationResult(result)
             return
         }
         switch result {
@@ -279,6 +318,12 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
                     self.sendAuthorizationExternalForm(generation: resultGeneration)
                 }
             }
+        }
+    }
+
+    private static func discardAuthorizationResult(_ result: AuthorizationResult) {
+        if case .granted(let grant) = result {
+            AuthorizationFree(grant.reference, [.destroyRights])
         }
     }
 
@@ -445,6 +490,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
     }
 
     private func fail(_ failure: Failure) {
+        authorizationWait.cancel()
         state = .stopped
         didEmitAuthorized = false
         invalidateConnection()
@@ -452,6 +498,7 @@ public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
     }
 
     private func stopOnQueue(emitEvent: Bool) {
+        authorizationWait.cancel()
         generation &+= 1
         state = .stopped
         invalidateConnection()
