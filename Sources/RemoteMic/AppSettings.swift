@@ -429,8 +429,14 @@ final class AppSettings: ObservableObject {
     private(set) var lastKnownAudioDeviceUID: String
 
     @Published var customMappingEnabled: Bool {
-        didSet { defaults.set(customMappingEnabled, forKey: Keys.customMappingEnabled) }
+        didSet {
+            defaults.set(customMappingEnabled, forKey: Keys.customMappingEnabled)
+            if oldValue && !customMappingEnabled { onCustomMappingDisabled?() }
+        }
     }
+
+    /// Stop captured holds synchronously, before callers restore native input.
+    var onCustomMappingDisabled: (() -> Void)?
 
     var configuredActionOverride: ((UUID?, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
     @Published var unifiedBaseBindings: [UnifiedButtonBinding] = [] {
