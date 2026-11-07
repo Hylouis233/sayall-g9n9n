@@ -13,13 +13,16 @@ SAYALL_LOCAL_PUBLIC=1 SAYALL_LOCAL_SIGNING_IDENTITY='<本地开发签名标识>'
 
 本地包通过合入上游源码、执行回归并重新打包更新，保留用户设置与构建号。该包不会自动替换为上游通用安装包。源码与验证状态见 [G9N9N验收手册](Testing/G9N9NRemote.md)；真实睡眠、无线异常及其他遥控器型号的未验边界仍保留。
 
+当前日常使用建议每段50秒内。长测在约60秒断流，70秒扩展验收与保活修复已暂缓；没有新增软件限时，也不声明长录音支持。
+
 此仓库为保留隐私而以公开快照初始化，和原上游不共享完整提交历史。后续更新在当前本机适配分支新建同步分支，按上面记录的上游基线重放差异，处理冲突并回归后再打包：
 
 ```sh
 # 首次克隆时添加；本地已存在 upstream 时略过这一行
 git remote add upstream https://github.com/HD838A/remote-mic-app.git
+git fetch --ipv4 origin main
 git fetch --ipv4 upstream main
-git switch -c sync/upstream-update feat/g9n9n-local
+git switch -c sync/upstream-update origin/main
 git diff --binary a29dad82de72fc56f0d1b7fde64fb00bdb0f083e upstream/main > /tmp/sayall-upstream.patch
 git apply --3way /tmp/sayall-upstream.patch
 ```
