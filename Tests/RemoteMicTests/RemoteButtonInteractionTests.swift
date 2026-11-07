@@ -131,6 +131,73 @@ struct RemoteButtonInteractionTests {
         }
     }
 
+    @Test func mappingDisableSynchronouslyCancelsEverySource() throws {
+        let name = "SayAll.DisableMapping.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let clock = InteractionClock()
+        let first = RemoteButtonInteractionController(scheduler: clock)
+        let second = RemoteButtonInteractionController(scheduler: clock)
+        var controllers = [first, second]
+        let model = BridgeAppModel(settings: settings,
+            chromecastFeature: ChromecastFeatureIntegration(hardwareEnabled: false),
+            makeButtonInteractionController: { controllers.removeFirst() })
+        var count = 0
+        for source in ["chromecast:fixture", "apple:fixture"] {
+            model.routeConfiguredButtonInteraction(.press, button: .mute,
+                profileID: UUID(), source: source, snapshot: snapshot(.repeatSingle),
+                contextIsValid: { true }, perform: { _, _ in count += 1; return true })
+        }
+        clock.advance(500)
+        #expect(count > 2)
+        settings.customMappingEnabled = false
+        // No clock tick or foreground change may be needed to stop deletion.
+        #expect(!first.isTracking(.mute))
+        #expect(!second.isTracking(.mute))
+        let atDisable = count
+        clock.advance(2_000)
+        #expect(count == atDisable)
+    }
+
+    @Test func disabledHostRejectsNewPressAndLateRelease() throws {
+        let name = "SayAll.DisabledHost.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        let model = BridgeAppModel(settings: settings,
+            chromecastFeature: ChromecastFeatureIntegration(hardwareEnabled: false),
+            makeButtonInteractionController: { controller })
+        var count = 0
+        func edge(_ phase: RemoteButtonPhase, config: RemoteButtonInteractionSnapshot) {
+            model.routeConfiguredButtonInteraction(phase, button: .mute,
+                profileID: nil, source: "chromecast:fixture", snapshot: config,
+                contextIsValid: { true }, perform: { _, _ in count += 1; return true })
+        }
+        edge(.press, config: snapshot(double: true))
+        #expect(count == 0)
+        settings.customMappingEnabled = false
+        edge(.release, config: snapshot(double: true))
+        clock.advance(1_000)
+        #expect(count == 0)
+        edge(.press, config: snapshot(.repeatSingle))
+        clock.advance(2_000)
+        #expect(count == 0)
+        #expect(!controller.isTracking(.mute))
+        settings.customMappingEnabled = true
+        edge(.release, config: snapshot())
+        #expect(count == 0)
+        edge(.press, config: snapshot())
+        edge(.release, config: snapshot())
+        clock.advance(3_000)
+        #expect(count == 1)
+        #expect(!controller.isTracking(.mute))
+    }
+
     @Test func opaqueSecondaryGesturesRemainRecognizableButCannotRepeat() {
         var config = snapshot()
         config.opaqueLong = true
