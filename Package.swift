@@ -1,0 +1,629 @@
+// swift-tools-version: 6.2
+import Foundation
+import PackageDescription
+
+var packageDependencies: [Package.Dependency] = [
+    .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.6"),
+]
+let privateSwiftPMEnabled = ProcessInfo.processInfo.environment[
+    "SAYALL_ENABLE_PRIVATE_SWIFTPM"
+] == "1"
+let privatePlatformPackage = "sayall-private-platform"
+let privatePlatformPackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH"
+]
+var remoteMicDependencies: [Target.Dependency] = [
+    "AudioExceptionGuard",
+    "AppleRemoteSupport",
+    "AppleRemoteAudioCore",
+    "AppleRemoteHCIProtocol",
+    "AppleRemotePacketLogger",
+    "SayAllMCPKit",
+    .product(name: "Sparkle", package: "Sparkle"),
+]
+var remoteMicTestDependencies: [Target.Dependency] = [
+    "RemoteMic",
+    "AppleRemoteAudioCore",
+    "AppleRemotePacketLogger",
+]
+var packageTargets: [Target] = []
+let macRemotePackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_MAC_REMOTE_PACKAGE_PATH"
+]
+let privateArtifactPackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH"
+]
+let macRemoteEnabled = privateSwiftPMEnabled || !(macRemotePackagePath ?? "").isEmpty ||
+    !(privateArtifactPackagePath ?? "").isEmpty
+if privateSwiftPMEnabled {
+    if let privatePlatformPackagePath, !privatePlatformPackagePath.isEmpty {
+        packageDependencies.append(.package(path: privatePlatformPackagePath))
+    } else {
+        fatalError(
+            "SAYALL_ENABLE_PRIVATE_SWIFTPM requires SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH"
+        )
+    }
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacRemoteCore", package: privatePlatformPackage)
+    )
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacRemoteUI", package: privatePlatformPackage)
+    )
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllMacRemoteCore", package: privatePlatformPackage)
+    )
+} else if let macRemotePackagePath, !macRemotePackagePath.isEmpty,
+          (privateArtifactPackagePath ?? "").isEmpty {
+    let packageIdentity = URL(fileURLWithPath: macRemotePackagePath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: macRemotePackagePath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacRemoteCore", package: packageIdentity)
+    )
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacRemoteUI", package: packageIdentity)
+    )
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllMacRemoteCore", package: packageIdentity)
+    )
+} else if (privateArtifactPackagePath ?? "").isEmpty {
+    remoteMicDependencies += ["SayAllMacRemoteCore", "SayAllMacRemoteUI"]
+    remoteMicTestDependencies.append("SayAllMacRemoteCore")
+    packageTargets += [
+        .target(
+            name: "SayAllMacRemoteCore",
+            path: "Sources/PublicRemoteCompatibility/Core"
+        ),
+        .target(
+            name: "SayAllMacRemoteUI",
+            dependencies: ["SayAllMacRemoteCore"],
+            path: "Sources/PublicRemoteCompatibility/UI"
+        ),
+    ]
+}
+let siriRemotePackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_SIRI_REMOTE_PACKAGE_PATH"
+]
+let siriRemoteExplicitlyEnabled = ProcessInfo.processInfo.environment[
+    "SAYALL_ENABLE_SIRI_REMOTE"
+] == "1"
+let siriRemoteEnabled = privateSwiftPMEnabled || siriRemoteExplicitlyEnabled ||
+    !(siriRemotePackagePath ?? "").isEmpty
+if siriRemoteExplicitlyEnabled && (siriRemotePackagePath ?? "").isEmpty &&
+    !privateSwiftPMEnabled && (privateArtifactPackagePath ?? "").isEmpty {
+    fatalError("SAYALL_ENABLE_SIRI_REMOTE=1 requires SAYALL_SIRI_REMOTE_PACKAGE_PATH")
+}
+let privateChromecastEnabled = privateSwiftPMEnabled &&
+    ProcessInfo.processInfo.environment["SAYALL_ENABLE_CHROMECAST"] == "1"
+let privateButtonProfilesEnabled = privateSwiftPMEnabled &&
+    ProcessInfo.processInfo.environment["SAYALL_ENABLE_BUTTON_PROFILES"] == "1"
+let chromecastPackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_CHROMECAST_PACKAGE_PATH"
+]
+let combinationActionsPackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_COMBINATION_ACTIONS_PATH"
+]
+let buttonProfilesPackagePath = ProcessInfo.processInfo.environment[
+    "SAYALL_BUTTON_PROFILES_PACKAGE_PATH"
+]
+if privateSwiftPMEnabled {
+    let sourcePaths = [
+        combinationActionsPackagePath,
+        buttonProfilesPackagePath,
+        macRemotePackagePath,
+        siriRemotePackagePath,
+        chromecastPackagePath,
+        privateArtifactPackagePath,
+    ]
+    if sourcePaths.contains(where: { !($0 ?? "").isEmpty }) {
+        fatalError("SAYALL_ENABLE_PRIVATE_SWIFTPM cannot be combined with local private package paths")
+    }
+}
+let sourceMacroCapabilitiesAvailable = privateSwiftPMEnabled ||
+    (combinationActionsPackagePath.map {
+        FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: $0)
+                .appendingPathComponent("Sources/SayAllMacroRemoteMic/RemoteMicRemoteCapabilities.swift")
+                .path
+        )
+    } ?? false)
+let privateArtifactsAvailable = !(privateArtifactPackagePath ?? "").isEmpty
+let unifiedButtonConfigurationAvailable = privateSwiftPMEnabled || privateArtifactsAvailable || (combinationActionsPackagePath.map {
+    FileManager.default.fileExists(atPath: URL(fileURLWithPath: $0)
+        .appendingPathComponent("Sources/SayAllMacroRemoteMic/UnifiedButtonConfiguration.swift").path)
+} ?? false)
+let macroCapabilitiesAvailable = sourceMacroCapabilitiesAvailable || privateArtifactsAvailable
+let sourceMacroInputFocusAvailable = privateSwiftPMEnabled ||
+    (combinationActionsPackagePath.map {
+        FileManager.default.fileExists(atPath: URL(fileURLWithPath: $0)
+            .appendingPathComponent("Sources/SayAllMacroRemoteMic/RemoteMicInputFocuser.swift").path)
+    } ?? false)
+let artifactMacroInputFocusAvailable = privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let interface = URL(fileURLWithPath: path)
+            .appendingPathComponent("Artifacts/SayAllMacroRemoteMic.xcframework/macos-arm64_x86_64/SayAllMacroRemoteMic.framework/Modules/SayAllMacroRemoteMic.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: interface, encoding: .utf8))?
+            .contains("public typealias RemoteMicInputFocuser =") == true
+    }
+} ?? false
+let macroInputFocusAvailable = sourceMacroInputFocusAvailable || artifactMacroInputFocusAvailable
+let sourceMacroHostShortcutsAvailable = [combinationActionsPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-combination-actions").path
+} : nil]
+    .compactMap { $0 }.contains { path in
+        FileManager.default.fileExists(atPath: URL(fileURLWithPath: path)
+            .appendingPathComponent("Sources/SayAllMacroRemoteMic/RemoteMicKeyboardShortcutPerformer.swift").path)
+    }
+let artifactMacroHostShortcutsAvailable = privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let interface = URL(fileURLWithPath: path)
+            .appendingPathComponent("Artifacts/SayAllMacroRemoteMic.xcframework/macos-arm64_x86_64/SayAllMacroRemoteMic.framework/Modules/SayAllMacroRemoteMic.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: interface, encoding: .utf8))?
+            .contains("public typealias RemoteMicKeyboardShortcutPerformer =") == true
+    }
+} ?? false
+// Keep hosts buildable with packages from before missing-reference cleanup.
+let profileMissingBindingCleanupAvailable = [buttonProfilesPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+} : nil].compactMap { $0 }.contains { path in
+    let url = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/SayAllButtonProfilesFeature.swift")
+    return (try? String(contentsOf: url, encoding: .utf8))?.contains("canCleanMacroReferences") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let url = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: url, encoding: .utf8))?.contains("canCleanMacroReferences") == true
+    }
+} ?? false)
+let profilesPackageIncluded = privateButtonProfilesEnabled || privateArtifactsAvailable || !(buttonProfilesPackagePath ?? "").isEmpty
+let macroMissingBindingCleanupAvailable = (!profilesPackageIncluded || profileMissingBindingCleanupAvailable) && ([combinationActionsPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-combination-actions").path
+} : nil].compactMap { $0 }.contains { path in
+    let url = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllMacroRemoteMic/SayAllMacroRemoteMicFeature.swift")
+    return (try? String(contentsOf: url, encoding: .utf8))?.contains("onRemoveMissingBindings:") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let url = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllMacroRemoteMic.xcframework/macos-arm64_x86_64/SayAllMacroRemoteMic.framework/Modules/SayAllMacroRemoteMic.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: url, encoding: .utf8))?.contains("onRemoveMissingBindings:") == true
+    }
+} ?? false))
+// Probe optional interfaces so older local packages remain buildable.
+func artifactSupportsAuthorizedAccess(module: String, decision: String) -> Bool {
+    guard let privateArtifactPackagePath, !privateArtifactPackagePath.isEmpty else { return false }
+    return ["arm64", "x86_64"].allSatisfy { architecture in
+        let interface = URL(fileURLWithPath: privateArtifactPackagePath)
+            .appendingPathComponent("Artifacts/\(module).xcframework/macos-arm64_x86_64/\(module).framework/Modules/\(module).swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        guard let source = try? String(contentsOf: interface, encoding: .utf8),
+              let declaration = source.range(of: "public enum \(decision) "),
+              let end = source.range(of: "\n}", range: declaration.upperBound..<source.endIndex) else { return false }
+        return source[declaration.upperBound..<end.lowerBound].contains("case authorized")
+    }
+}
+let membershipAuthorizedAccessAvailable = artifactSupportsAuthorizedAccess(module: "SayAllMembershipHostAdapter", decision: "MembershipHostButtonProfilesAccessDecision")
+let profilesAuthorizedAccessAvailable = artifactSupportsAuthorizedAccess(module: "SayAllButtonProfiles", decision: "ButtonProfilesAccessDecision") ||
+    [buttonProfilesPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+        URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+    } : nil].compactMap { $0 }.contains { path in
+        let source = URL(fileURLWithPath: path)
+            .appendingPathComponent("Sources/SayAllButtonProfiles/ButtonProfilesAccessDecision.swift")
+        return (try? String(contentsOf: source, encoding: .utf8))?.contains("case authorized") == true
+    }
+let buttonProfilesTestAccessEnabled = ProcessInfo.processInfo.environment[
+    "SAYALL_TEST_BUTTON_PROFILES_FREE"
+] == "1"
+if buttonProfilesTestAccessEnabled && (buttonProfilesPackagePath ?? "").isEmpty {
+    fatalError("free button profile test access requires the source button profiles package")
+}
+if buttonProfilesTestAccessEnabled && privateArtifactsAvailable {
+    fatalError("free button profile test access excludes private membership artifacts")
+}
+let chromecastEnabled = privateChromecastEnabled || !(chromecastPackagePath ?? "").isEmpty
+let macOSPlatform: SupportedPlatform = ProcessInfo.processInfo.environment["RELEASE_VARIANT"] == "intel"
+    ? .macOS(.v13)
+    : .macOS(.v14)
+var remoteMicSwiftSettings: [SwiftSetting] = []
+// Match the existing optional-interface probes: old private packages keep their
+// original initializer, while source and binary packages exposing this API share the host poll.
+let siriPermissionMonitorAvailable = [
+    siriRemotePackagePath,
+    privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+        URL(fileURLWithPath: $0).appendingPathComponent("packages/audio-input-kit/siri-remote").path
+    } : nil,
+].compactMap { $0 }.contains { path in
+    let url = URL(fileURLWithPath: path)
+        .appendingPathComponent("Sources/SayAllSiriRemote/SayAllSiriRemotePermissionMonitoring.swift")
+    return (try? String(contentsOf: url, encoding: .utf8))?
+        .contains("public protocol SayAllSiriRemotePermissionMonitor:") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let url = URL(fileURLWithPath: path).appendingPathComponent(
+            "Artifacts/SayAllSiriRemote.xcframework/macos-arm64_x86_64/SayAllSiriRemote.framework/Modules/SayAllSiriRemote.swiftmodule/\(architecture)-apple-macos.swiftinterface"
+        )
+        return (try? String(contentsOf: url, encoding: .utf8))?
+            .contains("public protocol SayAllSiriRemotePermissionMonitor :") == true
+    }
+} ?? false)
+if siriPermissionMonitorAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_SIRI_PERMISSION_MONITOR"))
+}
+if membershipAuthorizedAccessAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_MEMBERSHIP_AUTHORIZED_ACCESS"))
+}
+if profilesAuthorizedAccessAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_PROFILES_AUTHORIZED_ACCESS"))
+}
+if siriRemoteEnabled {
+    remoteMicSwiftSettings.append(.define("SAYALL_SIRI_REMOTE_ENABLED"))
+}
+if chromecastEnabled {
+    remoteMicSwiftSettings.append(.define("SAYALL_CHROMECAST_ENABLED"))
+}
+if macRemoteEnabled {
+    remoteMicSwiftSettings.append(.define("SAYALL_MAC_REMOTE_ENABLED"))
+}
+if macroCapabilitiesAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_MACRO_REMOTE_CAPABILITIES"))
+}
+if macroInputFocusAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_MACRO_INPUT_FOCUS"))
+}
+if sourceMacroHostShortcutsAvailable || artifactMacroHostShortcutsAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_MACRO_HOST_SHORTCUTS"))
+}
+if macroMissingBindingCleanupAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_MACRO_MISSING_BINDING_CLEANUP"))
+}
+if buttonProfilesTestAccessEnabled {
+    remoteMicSwiftSettings.append(.define("SAYALL_TEST_BUTTON_PROFILES_FREE"))
+}
+if unifiedButtonConfigurationAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_UNIFIED_BUTTON_CONFIGURATION"))
+}
+// Optional API probe preserves builds with previously released private components.
+let buttonHoldModesAvailable = [buttonProfilesPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+} : nil].compactMap { $0 }.contains { path in
+    let api = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/SayAllButtonProfilesFeature.swift")
+    return (try? String(contentsOf: api, encoding: .utf8))?.contains("public func holdMode(profile:") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let api = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: api, encoding: .utf8))?.contains("func holdMode(profile:") == true
+    }
+} ?? false)
+if buttonHoldModesAvailable { remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_HOLD_MODES")) }
+/// 契约边界用版本号表达（docs/release/packaging-governance.md §4），不探测私有源码特征。
+/// 只有走 artifact 时才需要判断版本；本地指向私有源码即视为最新。
+let privatePlatformManifestVersion: (Int, Int, Int)? = {
+    let manifest = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("config/release-dependencies.json")
+    guard let data = try? Data(contentsOf: manifest),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let dependencies = root["dependencies"] as? [String: Any],
+          let entry = dependencies["sayAllPrivatePlatform"] as? [String: Any],
+          let version = entry["version"] as? String
+    else { return nil }
+    let parts = version.split(separator: ".").compactMap { Int($0) }
+    guard parts.count == 3 else { return nil }
+    return (parts[0], parts[1], parts[2])
+}()
+/// 私有包从这个版本起提供 `resolvedBindingText` / `shortcutLabel`。
+let bindingTextSince: (Int, Int, Int) = (2, 6, 2)
+let bindingTextAvailable = privateSwiftPMEnabled
+    || !(buttonProfilesPackagePath ?? "").isEmpty
+    || (privateArtifactsAvailable
+        && (privatePlatformManifestVersion.map { $0 >= bindingTextSince } ?? false))
+if bindingTextAvailable { remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_BINDING_TEXT")) }
+/// 截图/测试用的同步加载入口从这个版本起提供。
+let screenshotProfileSeedSince: (Int, Int, Int) = (2, 6, 3)
+let screenshotProfileSeedAvailable = privateSwiftPMEnabled
+    || !(buttonProfilesPackagePath ?? "").isEmpty
+    || (privateArtifactsAvailable
+        && (privatePlatformManifestVersion.map { $0 >= screenshotProfileSeedSince } ?? false))
+if screenshotProfileSeedAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_SCREENSHOT_PROFILE_SEED"))
+}
+var remoteMicLinkerSettings: [LinkerSetting] = []
+if privateArtifactsAvailable { remoteMicLinkerSettings.append(.unsafeFlags(["-Xlinker", "-ObjC"])) }
+
+var remoteMicTestSwiftSettings: [SwiftSetting] = []
+if buttonHoldModesAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_HOLD_MODES")) }
+if bindingTextAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_BINDING_TEXT")) }
+if screenshotProfileSeedAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_SCREENSHOT_PROFILE_SEED")) }
+if sourceMacroHostShortcutsAvailable || artifactMacroHostShortcutsAvailable {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_MACRO_HOST_SHORTCUTS"))
+}
+if unifiedButtonConfigurationAvailable {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_UNIFIED_BUTTON_CONFIGURATION"))
+}
+// 方案作用域的集成测试与 App 共用同一个放行开关，否则测试目标看不到该宏。
+if buttonProfilesTestAccessEnabled {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_TEST_BUTTON_PROFILES_FREE"))
+}
+if siriRemoteEnabled {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_SIRI_REMOTE_ENABLED"))
+}
+if chromecastEnabled {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_CHROMECAST_ENABLED"))
+}
+if macRemoteEnabled {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_MAC_REMOTE_ENABLED"))
+}
+
+if let privateFeaturePath = ProcessInfo.processInfo.environment[
+    "SAYALL_AI_PACKAGE_PATH"
+], !privateFeaturePath.isEmpty {
+    let packageIdentity = URL(fileURLWithPath: privateFeaturePath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: privateFeaturePath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllAI", package: packageIdentity)
+    )
+}
+
+if privateSwiftPMEnabled {
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacroRemoteMic", package: privatePlatformPackage)
+    )
+    if privateButtonProfilesEnabled {
+        remoteMicDependencies.append(
+            .product(name: "SayAllButtonProfiles", package: privatePlatformPackage)
+        )
+    }
+    remoteMicDependencies.append(
+        .product(name: "SayAllMembershipHostAdapter", package: privatePlatformPackage)
+    )
+    remoteMicDependencies.append(
+        .product(name: "SayAllDiagnosticsTransport", package: privatePlatformPackage)
+    )
+    remoteMicDependencies.append(
+        .product(name: "SayAllSiriRemote", package: privatePlatformPackage)
+    )
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllMacroRemoteMic", package: privatePlatformPackage)
+    )
+    if privateButtonProfilesEnabled {
+        remoteMicTestDependencies.append(
+            .product(name: "SayAllButtonProfiles", package: privatePlatformPackage)
+        )
+    }
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllSiriRemote", package: privatePlatformPackage)
+    )
+    if privateChromecastEnabled {
+        remoteMicDependencies.append(
+            .product(name: "SayAllChromecast", package: privatePlatformPackage)
+        )
+        remoteMicTestDependencies.append(
+            .product(name: "SayAllChromecast", package: privatePlatformPackage)
+        )
+    }
+}
+
+if let siriRemotePath = siriRemotePackagePath, !siriRemotePath.isEmpty,
+   !privateArtifactsAvailable {
+    let packageIdentity = URL(fileURLWithPath: siriRemotePath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: siriRemotePath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllSiriRemote", package: packageIdentity)
+    )
+    // 测试目标同样要能引用私有包：能力与型号自报做跨仓一致性校验
+    // （见 Tests/RemoteMicTests/SiriCapabilityContractTests.swift）。
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllSiriRemote", package: packageIdentity)
+    )
+}
+
+if let chromecastPath = chromecastPackagePath, !chromecastPath.isEmpty,
+   !privateArtifactsAvailable {
+    let packageIdentity = URL(fileURLWithPath: chromecastPath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: chromecastPath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllChromecast", package: packageIdentity)
+    )
+    // 测试目标也要能引用私有包：能力矩阵要与型号自报的能力声明做跨仓一致性校验
+    // （见 Tests/RemoteMicTests/ChromecastCapabilityContractTests.swift）。
+    remoteMicTestDependencies.append(
+        .product(name: "SayAllChromecast", package: packageIdentity)
+    )
+}
+
+
+if let combinationActionsPath = combinationActionsPackagePath, !combinationActionsPath.isEmpty {
+    let packageIdentity = URL(fileURLWithPath: combinationActionsPath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: combinationActionsPath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllMacroRemoteMic", package: packageIdentity)
+    )
+}
+
+if let buttonProfilesPath = buttonProfilesPackagePath,
+   !buttonProfilesPath.isEmpty,
+   (privateArtifactPackagePath ?? "").isEmpty {
+    guard !(combinationActionsPackagePath ?? "").isEmpty else {
+        fatalError("SAYALL_BUTTON_PROFILES_PACKAGE_PATH requires SAYALL_COMBINATION_ACTIONS_PATH")
+    }
+    let packageIdentity = URL(fileURLWithPath: buttonProfilesPath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: buttonProfilesPath))
+    // 只登记 button profiles 自己的产品；Siri / Chromecast / Mac Remote 由各自的
+    // SAYALL_*_PACKAGE_PATH 分支登记，不能借这个包的 identity 引用别人的产品。
+    remoteMicDependencies.append(
+        .product(name: "SayAllButtonProfiles", package: packageIdentity)
+    )
+}
+
+let unsupportedMembershipSourceVariables = [
+    "SAYALL_MEMBERSHIP_PACKAGE_PATH",
+    "SAYALL_MEMBERSHIP_ADAPTER_PACKAGE_PATH",
+]
+if unsupportedMembershipSourceVariables.contains(where: {
+    !(ProcessInfo.processInfo.environment[$0] ?? "").isEmpty
+}) {
+    fatalError(
+        "membership source packages are not supported; " +
+            "use SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH"
+    )
+}
+
+if let privateArtifactPackagePath, !privateArtifactPackagePath.isEmpty {
+    let sourcePackageVariables = [
+        "SAYALL_COMBINATION_ACTIONS_PATH",
+        "SAYALL_BUTTON_PROFILES_PACKAGE_PATH",
+    ]
+    if sourcePackageVariables.contains(where: {
+        !(ProcessInfo.processInfo.environment[$0] ?? "").isEmpty
+    }) {
+        fatalError("private artifacts cannot be combined with private source packages")
+    }
+    let packageIdentity = URL(fileURLWithPath: privateArtifactPackagePath)
+        .lastPathComponent
+        .lowercased()
+    packageDependencies.append(.package(path: privateArtifactPackagePath))
+    remoteMicDependencies.append(
+        .product(name: "SayAllMembershipHostAdapter", package: packageIdentity)
+    )
+    remoteMicDependencies.append(
+        .product(name: "SayAllDiagnosticsTransport", package: packageIdentity)
+    )
+    remoteMicSwiftSettings.append(.define("SAYALL_MEMBERSHIP_ENABLED"))
+    remoteMicSwiftSettings.append(.define("SAYALL_DIAGNOSTICS_ENABLED"))
+    remoteMicDependencies.append(.product(name: "SayAllMacroRemoteMic", package: packageIdentity))
+    remoteMicDependencies.append(
+        .product(name: "SayAllButtonProfiles", package: packageIdentity)
+    )
+    remoteMicDependencies.append(.product(name: "SayAllMacRemoteCore", package: packageIdentity))
+    remoteMicDependencies.append(.product(name: "SayAllMacRemoteUI", package: packageIdentity))
+    remoteMicDependencies.append(.product(name: "SayAllSiriRemote", package: packageIdentity))
+    remoteMicDependencies.append(.product(name: "SayAllChromecast", package: packageIdentity))
+    remoteMicTestDependencies.append(.product(name: "SayAllSiriRemote", package: packageIdentity))
+    remoteMicTestDependencies.append(.product(name: "SayAllChromecast", package: packageIdentity))
+    remoteMicTestDependencies.append(.product(name: "SayAllMacRemoteCore", package: packageIdentity))
+    remoteMicTestDependencies.append(.product(name: "SayAllMacRemoteUI", package: packageIdentity))
+    remoteMicSwiftSettings.append(.define("SAYALL_SIRI_REMOTE_ENABLED"))
+    remoteMicSwiftSettings.append(.define("SAYALL_CHROMECAST_ENABLED"))
+    remoteMicSwiftSettings.append(.define("SAYALL_MAC_REMOTE_ENABLED"))
+    remoteMicTestSwiftSettings.append(.define("SAYALL_SIRI_REMOTE_ENABLED"))
+    remoteMicTestSwiftSettings.append(.define("SAYALL_CHROMECAST_ENABLED"))
+    remoteMicTestSwiftSettings.append(.define("SAYALL_MAC_REMOTE_ENABLED"))
+}
+
+if let hardwareSimulationPath = ProcessInfo.processInfo.environment[
+    "REMOTE_MIC_HARDWARE_SIMULATION_PATH"
+], !hardwareSimulationPath.isEmpty {
+    packageDependencies.append(.package(path: hardwareSimulationPath))
+    remoteMicTestDependencies.append(
+        .product(name: "HardwareSimulation", package: "hardware-simulation")
+    )
+    remoteMicTestDependencies.append(
+        .product(name: "XiaomiVoiceRemoteSimulation", package: "hardware-simulation")
+    )
+}
+
+let package = Package(
+    name: "RemoteMic",
+    platforms: [macOSPlatform],
+    products: [
+        .executable(
+            name: "RemoteMic",
+            targets: ["RemoteMic"]
+        ),
+        .executable(
+            name: "SayAllMCP",
+            targets: ["SayAllMCP"]
+        ),
+        .executable(
+            name: "AppleRemoteHCIService",
+            targets: ["AppleRemoteHCIService"]
+        ),
+    ],
+    dependencies: packageDependencies,
+    targets: packageTargets + [
+        .executableTarget(
+            name: "RemoteMic",
+            dependencies: remoteMicDependencies,
+            path: "Sources/RemoteMic",
+            swiftSettings: remoteMicSwiftSettings,
+            linkerSettings: remoteMicLinkerSettings + [
+                .linkedFramework("Network"),
+            ]
+        ),
+        .target(
+            name: "AudioExceptionGuard",
+            path: "Sources/AudioExceptionGuard",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "AppleRemoteSupport",
+            path: "Sources/AppleRemoteSupport",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+            ]
+        ),
+        .target(
+            name: "AppleRemoteAudioCore",
+            path: "Sources/AppleRemoteAudioCore"
+        ),
+        .target(
+            name: "AppleRemoteHCIProtocol",
+            path: "Sources/AppleRemoteHCIProtocol"
+        ),
+        .target(
+            name: "AppleRemotePacketLogger",
+            dependencies: ["AppleRemoteAudioCore", "AppleRemoteHCIProtocol"],
+            path: "Sources/AppleRemoteAudioCapture",
+            exclude: ["AppleRemoteVoiceController.swift", "main.swift"],
+            sources: ["SayAllBTPacketLoggerClient.swift"],
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
+        ),
+        .executableTarget(
+            name: "AppleRemoteAudioCapture",
+            dependencies: ["AppleRemoteAudioCore", "AppleRemotePacketLogger"],
+            path: "Sources/AppleRemoteAudioCapture",
+            exclude: ["SayAllBTPacketLoggerClient.swift"],
+            linkerSettings: [
+                .linkedFramework("IOKit"),
+                .linkedFramework("Network"),
+                .linkedFramework("Security"),
+            ]
+        ),
+        .executableTarget(
+            name: "AppleRemoteHCIService",
+            dependencies: ["AppleRemoteHCIProtocol"],
+            path: "Sources/AppleRemoteHCIService",
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
+        ),
+        .target(
+            name: "SayAllMCPKit",
+            path: "Sources/SayAllMCPKit"
+        ),
+        .executableTarget(
+            name: "SayAllMCP",
+            dependencies: ["SayAllMCPKit"],
+            path: "Sources/SayAllMCP"
+        ),
+        .testTarget(
+            name: "RemoteMicTests",
+            dependencies: remoteMicTestDependencies + ["SayAllMCPKit", "AppleRemoteHCIProtocol"],
+            path: "Tests/RemoteMicTests",
+            exclude: macRemoteEnabled ? [] : ["WatchBluetoothVoiceJourneyTests.swift"],
+            swiftSettings: remoteMicTestSwiftSettings
+        ),
+    ],
+    swiftLanguageModes: [.v5]
+)

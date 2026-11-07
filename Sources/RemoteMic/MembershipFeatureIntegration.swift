@@ -1,0 +1,430 @@
+import Combine
+import Foundation
+import SwiftUI
+
+#if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+import SayAllMembershipHostAdapter
+#endif
+
+enum HostRemoteSessionAccess: Equatable {
+    case authorized
+    case plusRequired
+}
+
+struct HostRemoteSessionAuthorization: Equatable {
+    let access: HostRemoteSessionAccess
+    let webSocketURL: URL
+    let sessionID: String?
+    let creatorToken: String?
+    let joinURL: URL?
+    let pairingCode: String?
+    let expiresAt: Date?
+}
+
+enum HostRemoteSessionFailure: Error, Equatable {
+    case signInRequired
+    case deviceBindingRequired
+    case plusRequired
+    case upgradeRequired
+    case unavailable
+    case networkUnavailable
+    case invalidResponse
+}
+
+struct HostRemoteSessionError: Error, Equatable {
+    let failure: HostRemoteSessionFailure
+    let reasonCode: String
+    let supportCode: Int
+    let requestID: String?
+
+    init(failure: HostRemoteSessionFailure, reasonCode: String = "internal_error",
+         supportCode: Int = -1900, requestID: String? = nil) {
+        self.failure = failure
+        self.reasonCode = reasonCode.range(of: #"^[a-z][a-z0-9_]{0,63}$"#,
+                                          options: .regularExpression) != nil
+            ? reasonCode : "internal_error"
+        self.supportCode = (-1999 ... -1000).contains(supportCode) ? supportCode : -1900
+        self.requestID = requestID.flatMap {
+            $0.range(of: #"^rq_[A-Za-z0-9_-]{20,64}$"#, options: .regularExpression) != nil ? $0 : nil
+        }
+    }
+
+    var diagnosticFields: String {
+        "reason_code=\(reasonCode) support_code=\(supportCode) request_id=\(requestID ?? "none")"
+    }
+}
+
+struct MembershipFeatureConfiguration: Equatable {
+    let appVersion: String
+
+    static func current(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundle: Bundle = .main
+    ) -> MembershipFeatureConfiguration? {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        return MembershipFeatureConfiguration(
+            appVersion: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        )
+        #else
+        nil
+        #endif
+    }
+}
+
+final class MembershipFeatureIntegration: ObservableObject, @unchecked Sendable {
+    @Published private(set) var isFeatureVisible = false
+    @Published private(set) var isEnvironmentSettingsVisible = false
+    @Published private(set) var buttonProfilesAccessDecision: HostButtonProfilesAccessDecision = .unavailable
+    @Published private(set) var canUseCompanionConnections = false
+    @Published private(set) var canUseCommonPhrases = false
+    @Published private(set) var accountDisplayName: String? = nil
+    @Published private(set) var serviceEnvironmentForDiagnostics = "unavailable"
+
+    private var localeIdentifier: String
+    #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+    private var adapter: MembershipHostAdapter?
+    private var subscriptions = Set<AnyCancellable>()
+    #endif
+
+    var supportsRemoteSessionAuthorization: Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        true
+        #else
+        false
+        #endif
+    }
+
+    init(localeIdentifier: String = Locale.current.identifier,
+         configuration: MembershipFeatureConfiguration? = .current()) {
+        self.localeIdentifier = localeIdentifier
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        if let configuration {
+            Task { @MainActor [weak self] in self?.configure(configuration) }
+        }
+        #endif
+    }
+
+    @MainActor var sectionTitle: String {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.sectionTitle ?? (Locale(identifier: localeIdentifier).identifier.lowercased().hasPrefix("zh") ? "会员" : "Membership")
+        #else
+        ""
+        #endif
+    }
+
+    var sectionSystemImage: String { "crown.fill" }
+
+    @MainActor func updateLocaleIdentifier(_ identifier: String) {
+        localeIdentifier = identifier
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.updateLocaleIdentifier(identifier)
+        #endif
+        objectWillChange.send()
+    }
+
+    @MainActor
+    func refreshIfNeeded() {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.refreshIfNeeded()
+        #endif
+    }
+
+    @MainActor
+    func settingsView() -> AnyView {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.settingsView() ?? AnyView(EmptyView())
+        #else
+        AnyView(EmptyView())
+        #endif
+    }
+
+    func configureConfigurationBackup(settings: AppSettings) {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        let defaults = settings.configurationDefaults
+        settings.configurationSupplementSnapshot = { [weak self] in
+            try MainActor.assumeIsolated {
+                if defaults === UserDefaults.standard, let adapter = self?.adapter {
+                    return try adapter.configurationCommonPhrasesSnapshot()
+                }
+                return try MembershipHostAdapter.exportCommonPhrasesConfiguration(defaults: defaults)
+            }
+        }
+        settings.configurationSupplementValidate = { data in
+            try MembershipHostAdapter.validateConfigurationCommonPhrases(data)
+        }
+        settings.configurationSupplementApply = { [weak self] data in
+            try MainActor.assumeIsolated {
+                if defaults === UserDefaults.standard, let adapter = self?.adapter {
+                    try adapter.restoreConfigurationCommonPhrases(data)
+                } else { try MembershipHostAdapter.restoreCommonPhrasesConfiguration(data, defaults: defaults) }
+            }
+        }
+        #endif
+    }
+
+    func openCommonPhrases(source: String = "host_action") -> Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.openCommonPhrases(source: source) ?? false }
+        #else
+        false
+        #endif
+    }
+
+    func openCommonPhrasesPreview(source: String = "host_preview") -> Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.openCommonPhrasesPreview(source: source) ?? false }
+        #else
+        false
+        #endif
+    }
+
+    func claimsCommonPhrase(button: String, source: String) -> Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.claimsCommonPhrase(button: button, source: source) ?? false }
+        #else
+        false
+        #endif
+    }
+
+    func handleCommonPhrase(button: String, phase: String, source: String) -> Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.handleCommonPhrase(button: button, phase: phase, source: source) ?? false }
+        #else
+        false
+        #endif
+    }
+
+    func resetCommonPhrases(source: String) {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.resetCommonPhrases(source: source) }
+        #endif
+    }
+
+    func closeCommonPhrases(reason: String = "host_close") {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        MainActor.assumeIsolated { adapter?.closeCommonPhrases(reason: reason) }
+        #endif
+    }
+
+    @MainActor
+    func commonPhrasesSettingsView(
+        onOpenMembership: @escaping () -> Void = {},
+        onReturn: @escaping () -> Void = {}
+    ) -> AnyView {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.commonPhrasesSettingsView(onReturn: onReturn, onOpenMembership: onOpenMembership) ?? AnyView(EmptyView())
+        #else
+        AnyView(EmptyView())
+        #endif
+    }
+
+    @MainActor
+    func membershipRequiredView(forButtonProfiles: Bool = false, remoteAuthorizationDenied: Bool = false, onOpenMembership: @escaping () -> Void) -> AnyView {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.membershipRequiredView(forButtonProfiles: forButtonProfiles, remoteAuthorizationDenied: remoteAuthorizationDenied, onOpenMembership: onOpenMembership) ?? AnyView(EmptyView())
+        #else
+        AnyView(EmptyView())
+        #endif
+    }
+
+    var canStartCompanionConnection: Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.canStartCompanionConnection ?? false
+        #else
+        false
+        #endif
+    }
+
+    /// 苹果遥控器只有**语音**是会员功能：连接、普通按键与触摸不读会员状态。
+    ///
+    /// 因此这里不能被用来拦住 `siriRemoteEnabled`（那会连带停掉连接和按键），
+    /// 只用于决定按下 Siri 键时是否允许开始采集。
+    var canUseSiriRemoteVoice: Bool {
+        switch buttonProfilesAccessDecision {
+        case .allowed, .temporarilyOffline, .authorized: return true
+        case .requiresPlus, .unavailable: return false
+        }
+    }
+
+    var remoteSessionMembershipBypassEnabled: Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.remoteSessionMembershipBypassEnabled ?? false
+        #else
+        false
+        #endif
+    }
+
+    @MainActor
+    func serviceEnvironmentSettingsView() -> AnyView {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        adapter?.serviceEnvironmentSettingsView() ?? AnyView(EmptyView())
+        #else
+        AnyView(EmptyView())
+        #endif
+    }
+
+    @MainActor
+    func createRemoteSessionAuthorization(
+        idempotencyKey: String,
+        clientContractVersion: Int = 1,
+        testMembershipBypass: Bool = false
+    ) async throws -> HostRemoteSessionAuthorization {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        guard let adapter else { throw HostRemoteSessionFailure.unavailable }
+        do {
+            let authorization = try await adapter.createRemoteSessionWithDiagnostics(
+                idempotencyKey: idempotencyKey,
+                clientContractVersion: clientContractVersion,
+                testMembershipBypass: testMembershipBypass
+            )
+            return HostRemoteSessionAuthorization(
+                access: authorization.access == .plusRequired
+                    ? .plusRequired
+                    : .authorized,
+                webSocketURL: authorization.webSocketURL,
+                sessionID: authorization.sessionID,
+                creatorToken: authorization.creatorToken,
+                joinURL: authorization.joinURL,
+                pairingCode: authorization.pairingCode,
+                expiresAt: authorization.expiresAt
+            )
+        } catch let error as MembershipHostRemoteSessionError {
+            throw HostRemoteSessionError(
+                failure: Self.mapRemoteSessionFailure(error.failure),
+                reasonCode: error.reasonCode, supportCode: error.supportCode,
+                requestID: error.requestID
+            )
+        } catch let failure as MembershipHostRemoteSessionFailure {
+            throw HostRemoteSessionError(failure: Self.mapRemoteSessionFailure(failure))
+        } catch {
+            throw HostRemoteSessionError(failure: .invalidResponse)
+        }
+        #else
+        throw HostRemoteSessionFailure.unavailable
+        #endif
+    }
+
+    #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+    private static func mapRemoteSessionFailure(
+        _ failure: MembershipHostRemoteSessionFailure
+    ) -> HostRemoteSessionFailure {
+        switch failure {
+        case .signInRequired: .signInRequired
+        case .deviceBindingRequired: .deviceBindingRequired
+        case .plusRequired: .plusRequired
+        case .upgradeRequired: .upgradeRequired
+        case .unavailable: .unavailable
+        case .networkUnavailable: .networkUnavailable
+        case .invalidResponse: .invalidResponse
+        @unknown default: .invalidResponse
+        }
+    }
+
+    @MainActor
+    private func configure(_ configuration: MembershipFeatureConfiguration) {
+        guard adapter == nil else { return }
+        let adapter = MembershipHostAdapter(appVersion: configuration.appVersion,
+            localeIdentifier: localeIdentifier,
+            localDiagnosticRecorder: { record in
+                guard let safeRecord = PrivateDiagnosticUploadRecord(recordID: record.recordID,
+                    occurredAt: record.occurredAt, category: record.category, fields: record.fields)
+                else { return }
+                AppLogger.shared.write(safeRecord.canonicalLine)
+            },
+            commonPhraseUnavailableTargetFallback: { processIdentifier in
+                KeyboardInjector.prepareCommonPhraseUnavailableTarget(
+                    processIdentifier: processIdentifier
+                )
+            })
+        self.adapter = adapter
+        adapter.$isFeatureVisible.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] in self?.isFeatureVisible = $0 }.store(in: &subscriptions)
+        adapter.$isEnvironmentSettingsVisible.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] in self?.isEnvironmentSettingsVisible = $0 }.store(in: &subscriptions)
+        adapter.$buttonProfilesAccessDecision.map(Self.mapAccessDecision).removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] decision in
+                self?.buttonProfilesAccessDecision = decision
+                AppLogger.shared.write(
+                    "MEMBERSHIP ACCESS state=\(Self.accessDecisionName(decision))"
+                )
+            }.store(in: &subscriptions)
+        adapter.$canUseCompanionConnections.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] in self?.canUseCompanionConnections = $0 }.store(in: &subscriptions)
+        adapter.$canUseCommonPhrases.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] in self?.canUseCommonPhrases = $0 }.store(in: &subscriptions)
+        adapter.$accountDisplayName.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] account in
+                self?.accountDisplayName = account
+                AppLogger.shared.write(
+                    "MEMBERSHIP ACCOUNT state=\(account == nil ? "signed_out" : "signed_in")"
+                )
+            }.store(in: &subscriptions)
+        adapter.$serviceEnvironmentForDiagnostics.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] in self?.serviceEnvironmentForDiagnostics = $0 }
+            .store(in: &subscriptions)
+    }
+
+    private static func mapAccessDecision(
+        _ decision: MembershipHostButtonProfilesAccessDecision
+    ) -> HostButtonProfilesAccessDecision {
+        switch decision {
+        case let .allowed(validUntil):
+            return .allowed(validUntil: validUntil)
+        case let .temporarilyOffline(validUntil):
+            return .temporarilyOffline(validUntil: validUntil)
+        #if SAYALL_MEMBERSHIP_AUTHORIZED_ACCESS
+        case .authorized:
+            return .authorized
+        #endif
+        case .requiresPlus:
+            return .requiresPlus
+        case .unavailable:
+            return .unavailable
+        @unknown default:
+            return .unavailable
+        }
+    }
+
+    private static func accessDecisionName(_ decision: HostButtonProfilesAccessDecision) -> String {
+        switch decision {
+        case .allowed: return "allowed"
+        case .temporarilyOffline: return "temporarily_offline"
+        case .authorized: return "authorized"
+        case .requiresPlus: return "requires_plus"
+        case .unavailable: return "unavailable"
+        }
+    }
+    #endif
+}
+extension MembershipFeatureIntegration: PrivateDiagnosticUploadProvider {
+    func pendingPrivateDiagnosticRecords() async -> [PrivateDiagnosticUploadRecord] {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        return await Task { @MainActor [weak self] in
+            guard let adapter = self?.adapter else { return [] }
+            let records = await adapter.pendingPrivateDiagnosticRecords()
+            return records.compactMap { record in
+                PrivateDiagnosticUploadRecord(
+                    recordID: record.recordID,
+                    occurredAt: record.occurredAt,
+                    category: record.category,
+                    fields: record.fields
+                )
+            }
+        }.value
+        #else
+        return []
+        #endif
+    }
+
+    func markPrivateDiagnosticRecordsUploaded(_ recordIDs: Set<String>) async -> Bool {
+        #if SAYALL_MEMBERSHIP_ENABLED && canImport(SayAllMembershipHostAdapter)
+        return await Task { @MainActor [weak self] in
+            guard let adapter = self?.adapter else { return false }
+            return await adapter.markPrivateDiagnosticRecordsUploaded(recordIDs)
+        }.value
+        #else
+        return false
+        #endif
+    }
+}

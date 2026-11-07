@@ -1,0 +1,775 @@
+import AppKit
+import ApplicationServices
+import CoreGraphics
+
+struct ScrollPageResult {
+    let outcome: ScrollPageOutcome
+    /// `nil` when movement was not measured; otherwise whether visible text moved.
+    let verifiedMovement: Bool?
+}
+
+/// Reads the accessibility tree just enough to find, record and scroll the area
+/// that Page Up / Page Down should act on.
+///
+/// Deliberately does not read `AXValue`, does not take screenshots and never
+/// moves keyboard focus (decisions S6, S12, S17).
+enum ScrollRegionInjector {
+    static let maximumScanNodes = 5_000
+
+    // MARK: - Learning
+
+    static func captureTarget(bundleIdentifier: String, point: CGPoint) -> ScrollRegionTarget? {
+        guard AXIsProcessTrusted() else { return nil }
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(
+            AXUIElementCreateSystemWide(),
+            Float(point.x), Float(point.y), &hit
+        ) == .success, let element = hit else { return nil }
+
+        var processIdentifier: pid_t = 0
+        guard AXUIElementGetPid(element, &processIdentifier) == .success,
+              !AXSelfTargetPolicy.isOwnProcess(processIdentifier),
+              NSRunningApplication(processIdentifier: processIdentifier)?.bundleIdentifier == bundleIdentifier
+        else { return nil }
+
+        // Chromium nests web content ~20 levels deep, so read the window from the
+        // dedicated attribute first and only then walk parents.
+        let window = axElement(element, kAXWindowAttribute) ?? ancestorWindow(of: element)
+        let windowFrame = window.flatMap(axFrame) ?? .zero
+        let container = scrollAncestor(of: element).flatMap { candidate -> AXUIElement? in
+            guard let containerFrame = axFrame(candidate),
+                  ScrollRegionRule.acceptsContainer(
+                      containerArea: Double(containerFrame.width * containerFrame.height),
+                      windowArea: Double(windowFrame.width * windowFrame.height)
+                  )
+            else { return nil }
+            return candidate
+        }
+        let anchor = container ?? window ?? element
+        let frame = axFrame(anchor) ?? .zero
+        guard windowFrame.width > 0, windowFrame.height > 0, frame.width > 0, frame.height > 0 else {
+            return nil
+        }
+
+        let supportsPageAction = container.map { axActions($0).contains("AXScrollUpByPage") } ?? false
+        return ScrollRegionTarget(
+            role: axString(anchor, kAXRoleAttribute),
+            identifier: axString(anchor, kAXIdentifierAttribute),
+            windowTitle: "",
+            context: ancestorContext(of: element, stoppingAt: window),
+            normalizedFrame: ScrollRegionRule.normalizedFrame(
+                elementFrame: frame, windowFrame: windowFrame
+            ),
+            source: .learned,
+            strategy: supportsPageAction ? .accessibilityPageAction : .lineWheel
+        )
+    }
+
+    // MARK: - Scrolling
+
+    static func scrollPage(
+        direction: ScrollPageDirection,
+        learnedTarget: ScrollRegionTarget? = nil,
+        verifyMovement: Bool = false
+    ) -> ScrollPageResult {
+        let started = Date()
+        let result = performScroll(direction: direction, learnedTarget: learnedTarget,
+                                   verifyMovement: verifyMovement)
+        let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-"
+        AppLogger.shared.write(
+            "SCROLL PAGE bundle=\(bundle) direction=\(direction == .up ? "up" : "down") " +
+            "strategy=\(learnedTarget?.strategy.rawValue ?? "preset") result=\(result.outcome.rawValue) " +
+            "verified=\(result.verifiedMovement.map(String.init) ?? "unknown") " +
+            "elapsed_ms=\(Int(Date().timeIntervalSince(started) * 1000))"
+        )
+        return result
+    }
+
+    private static func performScroll(
+        direction: ScrollPageDirection,
+        learnedTarget: ScrollRegionTarget?,
+        verifyMovement: Bool
+    ) -> ScrollPageResult {
+        guard AXIsProcessTrusted() else { return ScrollPageResult(outcome: .accessibilityUnavailable, verifiedMovement: nil) }
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              let bundleIdentifier = application.bundleIdentifier
+        else { return ScrollPageResult(outcome: .noFrontmostApplication, verifiedMovement: nil) }
+
+        // 自家窗口不走 AX：同进程 AX 应答会进 SwiftUI view graph（#678 同类）。
+        // 翻页键在设置页仍要能用，所以退回一个窗口高度的像素滚轮事件。
+        if AXSelfTargetPolicy.isOwnProcess(application.processIdentifier) {
+            let result = scrollOwnWindow(direction: direction)
+            AppLogger.shared.write(
+                "SCROLL PAGE bundle=\(bundleIdentifier) direction=\(direction == .up ? "up" : "down") " +
+                    "result=\(result.outcome.rawValue) reason=self_process"
+            )
+            return result
+        }
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let window = focusedWindow(of: applicationElement) else {
+            return ScrollPageResult(outcome: .regionUnavailable, verifiedMovement: nil)
+        }
+        let windowFrame = axFrame(window) ?? .zero
+
+        // Records taken on anonymous containers have no role to match against a
+        // live scroll area; they are replayed as a rectangle (S3).
+        if let learnedTarget, !usesContainerMatching(role: learnedTarget.role) {
+            return scrollRecordedRect(
+                learnedTarget, window: window, windowFrame: windowFrame,
+                direction: direction, verifyMovement: verifyMovement,
+                isValidTarget: makeTargetValidator(
+                    window: window, expectedFrame: windowFrame,
+                    processIdentifier: application.processIdentifier
+                )
+            )
+        }
+
+        let isValidTarget = makeTargetValidator(
+            window: window, expectedFrame: windowFrame, processIdentifier: application.processIdentifier
+        )
+
+        let candidate: Candidate
+        if let learnedTarget {
+            // 学过区域就用记录的中心点直接命中容器，省掉整棵树的多达 5000 个节点扫描；
+            // 命中结果对不上记录时再退回完整扫描。
+            if let direct = candidateAtLearnedPoint(
+                learnedTarget,
+                windowFrame: windowFrame,
+                processIdentifier: application.processIdentifier
+            ) {
+                candidate = direct
+            } else {
+                let candidates = scrollCandidates(in: window, windowFrame: windowFrame)
+                switch ScrollRegionRule.bestMatchIndex(in: candidates.map(\.descriptor), recorded: learnedTarget) {
+                case .matched(let found):
+                    candidate = candidates[found]
+                case .failed(let outcome):
+                    return ScrollPageResult(outcome: outcome, verifiedMovement: nil)
+                }
+            }
+        } else {
+            let candidates = scrollCandidates(in: window, windowFrame: windowFrame)
+            guard let preset = ScrollRegionPreset.rule(for: bundleIdentifier) else {
+                return ScrollPageResult(outcome: .needsCalibration, verifiedMovement: nil)
+            }
+            if preset.placement == .windowRect {
+                return scrollRect(
+                    windowFrame, window: window, direction: direction,
+                    verifyMovement: verifyMovement, isValidTarget: isValidTarget
+                )
+            }
+            // Presets only accept containers that are smaller than the window;
+            // apps exposing one whole-window web area scroll by window rect.
+            let containers = candidates.filter {
+                ScrollRegionRule.acceptsContainer(
+                    containerArea: Double($0.descriptor.frame.width * $0.descriptor.frame.height),
+                    windowArea: Double(windowFrame.width * windowFrame.height)
+                )
+            }
+            guard let found = ScrollRegionRule.presetCandidateIndex(in: containers.map(\.descriptor)) else {
+                return scrollRect(
+                    windowFrame, window: window, direction: direction,
+                    verifyMovement: verifyMovement, isValidTarget: isValidTarget
+                )
+            }
+            candidate = containers[found]
+        }
+        let before = verifyMovement
+            ? structuralSignature(in: window, region: candidate.descriptor.frame)
+            : [:]
+
+        if axActions(candidate.element).contains("AXScrollUpByPage") {
+            let action = direction == .up ? "AXScrollUpByPage" : "AXScrollDownByPage"
+            if AXUIElementPerformAction(candidate.element, action as CFString) == .success {
+                return finish(window: window, region: candidate.descriptor.frame, before: before,
+                              outcome: .scrolledByPageAction, verifyMovement: verifyMovement)
+            }
+            // 文本编辑这类 App 会声明支持 page action，实际执行却失败。
+            // 这时退回下面的滚轮注入，不要把这个能力缺口当成翻页失败抛给用户。
+            AppLogger.shared.write(
+                "SCROLL PAGE page_action_failed action=\(action) fallback=wheel " +
+                "bundle=\(bundleIdentifier)"
+            )
+        }
+
+        // No page action: scroll the recorded region by its visible height,
+        // never by the window centre (S6).
+        let center = CGPoint(x: candidate.descriptor.frame.midX, y: candidate.descriptor.frame.midY)
+        let outcome = runPageWheel(
+            direction: direction,
+            chunks: ScrollRegionRule.pageScrollChunks(regionHeight: Double(candidate.descriptor.frame.height)),
+            at: center,
+            isValidTarget: isValidTarget,
+            waitForCompletion: verifyMovement
+        )
+        guard outcome == .scrolledByPixelWheel || outcome == .queued else {
+            return ScrollPageResult(outcome: outcome, verifiedMovement: nil)
+        }
+        return finish(window: window, region: candidate.descriptor.frame, before: before,
+                      outcome: outcome, verifyMovement: verifyMovement)
+    }
+
+    /// 滚到顶部 / 底部：绝对位置语义，一次投递足够大的行数，冲过头由内容边界截住。
+    ///
+    /// 与翻页的区别：翻页是相对一屏、可连发；到边缘是一次性跳转、不可连发（见 PRODUCT_SPEC）。
+    static func scrollToEdge(
+        _ edge: ScrollEdge,
+        learnedTarget: ScrollRegionTarget? = nil
+    ) -> ScrollPageResult {
+        guard AXIsProcessTrusted() else {
+            return ScrollPageResult(outcome: .accessibilityUnavailable, verifiedMovement: nil)
+        }
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              let bundleIdentifier = application.bundleIdentifier
+        else { return ScrollPageResult(outcome: .noFrontmostApplication, verifiedMovement: nil) }
+
+        // 到顶/到底同样不碰自家 AX；一次足够大的像素滚轮由内容边界截住。
+        if AXSelfTargetPolicy.isOwnProcess(application.processIdentifier) {
+            let result = scrollOwnWindow(direction: edge == .top ? .up : .down, pages: 6)
+            AppLogger.shared.write(
+                "SCROLL EDGE bundle=\(bundleIdentifier) edge=\(edge == .top ? "top" : "bottom") " +
+                    "result=\(result.outcome.rawValue) reason=self_process"
+            )
+            return result
+        }
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let window = focusedWindow(of: applicationElement) else {
+            return ScrollPageResult(outcome: .regionUnavailable, verifiedMovement: nil)
+        }
+        let windowFrame = axFrame(window) ?? .zero
+        let region = edgeRegionRect(learnedTarget, windowFrame: windowFrame)
+
+        let isValidTarget = makeTargetValidator(
+            window: window, expectedFrame: windowFrame,
+            processIdentifier: application.processIdentifier
+        )
+        let before = structuralSignature(in: window, region: region)
+        let direction: ScrollPageDirection = edge == .top ? .up : .down
+        let outcome = runEdgeWheel(
+            direction: direction,
+            at: CGPoint(x: region.midX, y: region.midY),
+            isValidTarget: isValidTarget
+        )
+        AppLogger.shared.write(
+            "SCROLL EDGE bundle=\(bundleIdentifier) edge=\(edge == .top ? "top" : "bottom") " +
+            "lines=\(ScrollRegionRule.edgeScrollLines) result=\(outcome.rawValue)"
+        )
+        guard outcome == .scrolledByPixelWheel else {
+            return ScrollPageResult(outcome: outcome, verifiedMovement: nil)
+        }
+        return finish(window: window, region: region, before: before,
+                      outcome: .scrolledToEdge, verifyMovement: true)
+    }
+
+    private static func edgeRegionRect(
+        _ target: ScrollRegionTarget?,
+        windowFrame: CGRect
+    ) -> CGRect {
+        guard let frame = target?.normalizedFrame,
+              ScrollRegionRule.isValid(normalizedFrame: frame),
+              windowFrame.width > 0, windowFrame.height > 0
+        else { return windowFrame }
+        return CGRect(
+            x: windowFrame.minX + frame.x * windowFrame.width,
+            y: windowFrame.minY + frame.y * windowFrame.height,
+            width: frame.width * windowFrame.width,
+            height: frame.height * windowFrame.height
+        )
+    }
+
+    private static func runEdgeWheel(
+        direction: ScrollPageDirection,
+        at point: CGPoint,
+        isValidTarget: @escaping () -> Bool
+    ) -> ScrollPageOutcome {
+        var remaining = ScrollRegionRule.edgeScrollLines
+        while remaining > 0 {
+            guard isValidTarget() else { return .cancelled }
+            let lines = min(ScrollRegionRule.edgeLinesPerChunk, remaining)
+            guard postLineWheel(direction: direction, lines: lines, at: point) else {
+                return .eventFailed
+            }
+            remaining -= lines
+            if remaining > 0 {
+                Thread.sleep(forTimeInterval: ScrollRegionRule.chunkInterval)
+            }
+        }
+        return .scrolledByPixelWheel
+    }
+
+    static func usesContainerMatching(role: String) -> Bool {
+        role == "AXScrollArea" || role == "AXWebArea"
+    }
+
+    private static func scrollRecordedRect(
+        _ target: ScrollRegionTarget,
+        window: AXUIElement,
+        windowFrame: CGRect,
+        direction: ScrollPageDirection,
+        verifyMovement: Bool,
+        isValidTarget: @escaping () -> Bool
+    ) -> ScrollPageResult {
+        guard let frame = target.normalizedFrame,
+              ScrollRegionRule.isValid(normalizedFrame: frame),
+              windowFrame.width > 0, windowFrame.height > 0
+        else { return ScrollPageResult(outcome: .regionUnavailable, verifiedMovement: nil) }
+
+        let rect = CGRect(
+            x: windowFrame.minX + frame.x * windowFrame.width,
+            y: windowFrame.minY + frame.y * windowFrame.height,
+            width: frame.width * windowFrame.width,
+            height: frame.height * windowFrame.height
+        )
+        return scrollRect(
+            rect, window: window, direction: direction,
+            verifyMovement: verifyMovement, isValidTarget: isValidTarget
+        )
+    }
+
+    private static func scrollRect(
+        _ rect: CGRect,
+        window: AXUIElement,
+        direction: ScrollPageDirection,
+        verifyMovement: Bool,
+        isValidTarget: @escaping () -> Bool
+    ) -> ScrollPageResult {
+        guard rect.width >= 8, rect.height >= 8 else {
+            return ScrollPageResult(outcome: .regionUnavailable, verifiedMovement: nil)
+        }
+        let before = verifyMovement ? structuralSignature(in: window, region: rect) : [:]
+        let outcome = runPageWheel(
+            direction: direction,
+            chunks: ScrollRegionRule.pageScrollChunks(regionHeight: Double(rect.height)),
+            at: CGPoint(x: rect.midX, y: rect.midY),
+            isValidTarget: isValidTarget,
+            waitForCompletion: verifyMovement
+        )
+        guard outcome == .scrolledByPixelWheel || outcome == .queued else {
+            return ScrollPageResult(outcome: outcome, verifiedMovement: nil)
+        }
+        return finish(window: window, region: rect, before: before,
+                      outcome: outcome, verifyMovement: verifyMovement)
+    }
+
+    private static func finish(
+        window: AXUIElement,
+        region: CGRect?,
+        before: [String: CGFloat],
+        outcome: ScrollPageOutcome,
+        verifyMovement: Bool
+    ) -> ScrollPageResult {
+        guard verifyMovement, !before.isEmpty else {
+            return ScrollPageResult(outcome: outcome, verifiedMovement: nil)
+        }
+        Thread.sleep(forTimeInterval: 0.35)
+        let after = structuralSignature(in: window, region: region)
+        let moved = before.contains { key, y in
+            guard let newY = after[key] else { return false }
+            return abs(newY - y) > 1
+        }
+        return ScrollPageResult(outcome: outcome, verifiedMovement: moved)
+    }
+
+    // MARK: - Accessibility helpers
+
+    private struct Candidate {
+        let element: AXUIElement
+        let descriptor: ScrollRegionDescriptor
+    }
+
+    /// 用学习时记录的归一化区域做一次命中测试，直接拿到滚动容器。
+    ///
+    /// 学习阶段本来就是这么取到容器的（`captureTarget`），翻页时再扫一遍整棵树属于重复劳动：
+    /// 这里只走「命中元素 → 向上找滚动祖先」这两步，深度受限，节点数无关。
+    /// 任何一步对不上记录（角色、identifier、边界）都返回 nil，由调用方退回完整扫描。
+    private static func candidateAtLearnedPoint(
+        _ target: ScrollRegionTarget,
+        windowFrame: CGRect,
+        processIdentifier: pid_t
+    ) -> Candidate? {
+        // identifier 为空的区域分不清同名容器，宁可全量扫描，也不要滚错区域。
+        let started = Date()
+        guard !target.identifier.isEmpty,
+              let frame = target.normalizedFrame,
+              ScrollRegionRule.isValid(normalizedFrame: frame),
+              windowFrame.width > 0, windowFrame.height > 0
+        else { return miss("no_identifier") }
+
+        let rect = CGRect(
+            x: windowFrame.minX + frame.x * windowFrame.width,
+            y: windowFrame.minY + frame.y * windowFrame.height,
+            width: frame.width * windowFrame.width,
+            height: frame.height * windowFrame.height
+        )
+        guard rect.width >= 8, rect.height >= 8 else { return miss("rect") }
+
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(
+            AXUIElementCreateSystemWide(),
+            Float(rect.midX), Float(rect.midY), &hit
+        ) == .success, let element = hit else { return nil }
+
+        var hitProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(element, &hitProcessIdentifier) == .success,
+              hitProcessIdentifier == processIdentifier
+        else { return miss("pid") }
+
+        guard let container = scrollAncestor(of: element) else { return miss("no_container") }
+        let role = axString(container, kAXRoleAttribute)
+        guard role == target.role else { return miss("role_\(role)") }
+        if axString(container, kAXIdentifierAttribute) != target.identifier {
+            return miss("identifier")
+        }
+        guard let containerFrame = axFrame(container),
+              containerFrame.width >= 8, containerFrame.height >= 8,
+              containerFrame.intersects(windowFrame)
+        else { return miss("frame") }
+
+        AppLogger.shared.write(
+            "SCROLL DIRECT role=\(role) nodes_skipped=true " +
+                "elapsed_ms=\(Int(Date().timeIntervalSince(started) * 1000))"
+        )
+        return Candidate(
+            element: container,
+            descriptor: ScrollRegionDescriptor(
+                role: role,
+                identifier: target.identifier,
+                context: target.context,
+                frame: containerFrame,
+                windowFrame: windowFrame
+            )
+        )
+    }
+
+    private static func miss(_ reason: String) -> Candidate? {
+        AppLogger.shared.write("SCROLL DIRECT miss=\(reason)")
+        return nil
+    }
+
+    private static func focusedWindow(of applicationElement: AXUIElement) -> AXUIElement? {
+        [
+            axElement(applicationElement, kAXFocusedWindowAttribute),
+            axElement(applicationElement, kAXMainWindowAttribute),
+        ].compactMap { $0 }.first ?? axElements(applicationElement, kAXWindowsAttribute).first
+    }
+
+    private static func scrollCandidates(in window: AXUIElement, windowFrame: CGRect) -> [Candidate] {
+        let started = Date()
+        var result: [Candidate] = []
+        var stack: [(element: AXUIElement, depth: Int, context: String)] = [(window, 0, "")]
+        var visited = 0
+
+        while let current = stack.popLast(), visited < maximumScanNodes {
+            visited += 1
+            let role = axString(current.element, kAXRoleAttribute)
+            let identifier = axString(current.element, kAXIdentifierAttribute)
+            let own = [role, identifier].filter { !$0.isEmpty }.joined(separator: ":")
+            let context = String(([current.context, own].filter { !$0.isEmpty }
+                .joined(separator: " ")).suffix(256))
+
+            if role == "AXScrollArea" || role == "AXWebArea", let frame = axFrame(current.element) {
+                result.append(Candidate(
+                    element: current.element,
+                    descriptor: ScrollRegionDescriptor(
+                        role: role,
+                        identifier: identifier,
+                        context: context,
+                        frame: frame,
+                        windowFrame: windowFrame
+                    )
+                ))
+            }
+            if current.depth < 40 {
+                for child in axChildren(current.element) {
+                    stack.append((child, current.depth + 1, context))
+                }
+            }
+        }
+        AppLogger.shared.write(
+            "SCROLL SCAN nodes=\(visited) candidates=\(result.count) " +
+                "elapsed_ms=\(Int(Date().timeIntervalSince(started) * 1000))"
+        )
+        return result
+    }
+
+    /// Fingerprint of visible text positions, used only to confirm that a page
+    /// scroll actually moved content. Values are hashed and never persisted.
+    /// Structural signature inside the scrolled region: role, identifier and
+    /// size only. Never reads `AXValue` or any text, so a page can be confirmed
+    /// without touching content; nodes without an identifier are skipped and the
+    /// caller reports "unverified" instead of guessing.
+    private static func structuralSignature(in window: AXUIElement, region: CGRect?) -> [String: CGFloat] {
+        var signature: [String: CGFloat] = [:]
+        var stack = [window]
+        var visited = 0
+        while let element = stack.popLast(), visited < 4_000, signature.count < 600 {
+            visited += 1
+            let role = axString(element, kAXRoleAttribute)
+            if role == "AXStaticText" || role == "AXImage" || role == "AXButton" {
+                let identifier = axString(element, kAXIdentifierAttribute)
+                if !identifier.isEmpty, let frame = axFrame(element),
+                   region.map({ $0.intersects(frame) }) ?? true {
+                    signature["\(role):\(identifier):\(Int(frame.width))x\(Int(frame.height))"] = frame.minY
+                }
+            }
+            stack.append(contentsOf: axChildren(element))
+        }
+        return signature
+    }
+
+    private static func scrollAncestor(of element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var depth = 0
+        while let node = current, depth < 40 {
+            let role = axString(node, kAXRoleAttribute)
+            if role == "AXScrollArea" || role == "AXWebArea" { return node }
+            current = axElement(node, kAXParentAttribute)
+            depth += 1
+        }
+        return nil
+    }
+
+    private static func ancestorWindow(of element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var depth = 0
+        while let node = current, depth < 40 {
+            if axString(node, kAXRoleAttribute) == "AXWindow" { return node }
+            current = axElement(node, kAXParentAttribute)
+            depth += 1
+        }
+        return nil
+    }
+
+    private static func ancestorContext(of element: AXUIElement, stoppingAt window: AXUIElement?) -> String {
+        var parts: [String] = []
+        var current: AXUIElement? = axElement(element, kAXParentAttribute)
+        var depth = 0
+        while let node = current, depth < 12 {
+            let role = axString(node, kAXRoleAttribute)
+            if role == "AXWindow" { break }
+            let identifier = axString(node, kAXIdentifierAttribute)
+            if !role.isEmpty { parts.append(identifier.isEmpty ? role : "\(role):\(identifier)") }
+            if window.map({ CFEqual($0, node) }) == true { break }
+            current = axElement(node, kAXParentAttribute)
+            depth += 1
+        }
+        return String(parts.joined(separator: " ").suffix(256))
+    }
+
+    /// Outcome of a wheel page: either the queued batch ran to completion, was
+    /// cancelled/superseded, or the caller only got a queue acknowledgement.
+    private static func runPageWheel(
+        direction: ScrollPageDirection,
+        chunks: Int,
+        at point: CGPoint,
+        isValidTarget: @escaping () -> Bool,
+        waitForCompletion: Bool
+    ) -> ScrollPageOutcome {
+        let semaphore = DispatchSemaphore(value: 0)
+        let delivered = LockedBool()
+        guard enqueuePageWheel(
+            direction: direction,
+            chunks: chunks,
+            at: point,
+            isValidTarget: isValidTarget,
+            completion: { success in
+                delivered.value = success
+                semaphore.signal()
+            }
+        ) else { return .eventFailed }
+
+        guard waitForCompletion else { return .queued }
+        guard semaphore.wait(timeout: .now() + 2) == .success else { return .cancelled }
+        return delivered.value ? .scrolledByPixelWheel : .cancelled
+    }
+
+    private final class LockedBool {
+        private let lock = NSLock()
+        private var storage = false
+        var value: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return storage }
+            set { lock.lock(); storage = newValue; lock.unlock() }
+        }
+    }
+
+    /// Wheel chunks are posted from a serial queue so the HID thread is never
+    /// blocked. Before every chunk the target app and window are re-checked and
+    /// a newer page request cancels the previous one, so switching apps or
+    /// pressing twice never delivers stale events to the wrong window.
+    private static let pageScrollQueue = DispatchQueue(label: "RemoteMic.scroll-page")
+    private static let pageStateLock = NSLock()
+    private static var pageGeneration = 0
+
+    private static func makeTargetValidator(
+        window: AXUIElement,
+        expectedFrame: CGRect,
+        processIdentifier: pid_t
+    ) -> () -> Bool {
+        let expectedNumber = windowNumber(of: window)
+        return {
+            guard let frontmost = NSWorkspace.shared.frontmostApplication,
+                  frontmost.processIdentifier == processIdentifier
+            else { return false }
+            // Two same-sized windows of one app are told apart by window number.
+            if let expectedNumber, let currentNumber = windowNumber(of: window), currentNumber != expectedNumber {
+                return false
+            }
+            guard let current = axFrame(window) else { return false }
+            return abs(current.minX - expectedFrame.minX) <= 2 &&
+                abs(current.minY - expectedFrame.minY) <= 2 &&
+                abs(current.width - expectedFrame.width) <= 2 &&
+                abs(current.height - expectedFrame.height) <= 2
+        }
+    }
+
+    private static func windowNumber(of window: AXUIElement) -> Int? {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, "AXWindowNumber" as CFString, &raw) == .success,
+              let value = raw as? NSNumber
+        else { return nil }
+        return value.intValue
+    }
+
+    private static func enqueuePageWheel(
+        direction: ScrollPageDirection,
+        chunks: Int,
+        at point: CGPoint,
+        isValidTarget: @escaping () -> Bool,
+        completion: @escaping (Bool) -> Void
+    ) -> Bool {
+        guard chunks > 0 else { return false }
+        pageStateLock.lock()
+        pageGeneration += 1
+        let generation = pageGeneration
+        pageStateLock.unlock()
+
+        AppLogger.shared.write(
+            "SCROLL PAGE wheel chunks=\(chunks) lines_per_chunk=\(ScrollRegionRule.linesPerChunk) " +
+            "interval_ms=\(Int(ScrollRegionRule.chunkInterval * 1000)) state=queued"
+        )
+        pageScrollQueue.async {
+            for index in 0..<chunks {
+                pageStateLock.lock()
+                let current = pageGeneration
+                pageStateLock.unlock()
+                guard current == generation else {
+                    AppLogger.shared.write("SCROLL PAGE wheel aborted reason=superseded sent=\(index)")
+                    completion(false)
+                    return
+                }
+                guard isValidTarget() else {
+                    AppLogger.shared.write("SCROLL PAGE wheel aborted reason=target_changed sent=\(index)")
+                    completion(false)
+                    return
+                }
+                guard postLineWheel(
+                    direction: direction,
+                    lines: ScrollRegionRule.linesPerChunk,
+                    at: point
+                ) else {
+                    AppLogger.shared.write("SCROLL PAGE wheel aborted reason=event_failed sent=\(index)")
+                    completion(false)
+                    return
+                }
+                if index < chunks - 1 {
+                    Thread.sleep(forTimeInterval: ScrollRegionRule.chunkInterval)
+                }
+            }
+            AppLogger.shared.write("SCROLL PAGE wheel completed chunks=\(chunks)")
+            completion(true)
+        }
+        return true
+    }
+
+    /// 自家窗口的翻页回退：不查 AX，直接按窗口高度投递像素滚轮。
+    ///
+    /// 目标就是光标下的窗口，所以不设置别的定位；`pages` 只用于「到顶/到底」
+    /// 这种一次性大位移，冲过头由内容边界截住。
+    private static func scrollOwnWindow(
+        direction: ScrollPageDirection,
+        pages: Int = 1
+    ) -> ScrollPageResult {
+        guard let point = CGEvent(source: nil)?.location else {
+            return ScrollPageResult(outcome: .regionUnavailable, verifiedMovement: nil)
+        }
+        let windowHeight = (NSApp.keyWindow ?? NSApp.mainWindow)?.frame.height ?? 600
+        let pixels = Int32(max(240, windowHeight * CGFloat(pages)).rounded())
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let event = CGEvent(
+                  scrollWheelEvent2Source: source,
+                  units: .pixel,
+                  wheelCount: 1,
+                  wheel1: direction.wheelSign * pixels,
+                  wheel2: 0,
+                  wheel3: 0
+              )
+        else { return ScrollPageResult(outcome: .eventFailed, verifiedMovement: nil) }
+        event.location = point
+        event.post(tap: .cghidEventTap)
+        return ScrollPageResult(outcome: .scrolledByPixelWheel, verifiedMovement: nil)
+    }
+
+    private static func postLineWheel(direction: ScrollPageDirection, lines: Int32, at point: CGPoint) -> Bool {        guard let source = CGEventSource(stateID: .hidSystemState),
+              let event = CGEvent(
+                  scrollWheelEvent2Source: source,
+                  units: .line,
+                  wheelCount: 1,
+                  wheel1: direction.wheelSign * lines,
+                  wheel2: 0,
+                  wheel3: 0
+              )
+        else { return false }
+        event.location = point
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private static func axAttribute(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value
+    }
+
+    private static func axString(_ element: AXUIElement, _ attribute: String) -> String {
+        axAttribute(element, attribute) as? String ?? ""
+    }
+
+    private static func axElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        guard let raw = axAttribute(element, attribute),
+              CFGetTypeID(raw) == AXUIElementGetTypeID()
+        else { return nil }
+        return (raw as! AXUIElement)
+    }
+
+    private static func axElements(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+        axAttribute(element, attribute) as? [AXUIElement] ?? []
+    }
+
+    private static func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        axElements(element, kAXChildrenAttribute)
+    }
+
+    private static func axActions(_ element: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+        return names as? [String] ?? []
+    }
+
+    private static func axFrame(_ element: AXUIElement) -> CGRect? {
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard let position = axAttribute(element, kAXPositionAttribute),
+              let sizeValue = axAttribute(element, kAXSizeAttribute),
+              CFGetTypeID(position) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID()
+        else { return nil }
+        AXValueGetValue(position as! AXValue, .cgPoint, &origin)
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        guard size.width > 0, size.height > 0 else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+}

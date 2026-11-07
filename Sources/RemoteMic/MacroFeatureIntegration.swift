@@ -1,0 +1,1106 @@
+import Combine
+import Foundation
+#if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
+import SayAllChromecast
+#endif
+import SwiftUI
+
+#if canImport(SayAllMacroRemoteMic)
+import SayAllMacroCore
+import SayAllMacroRemoteMic
+#endif
+#if canImport(SayAllButtonProfiles)
+import SayAllButtonProfiles
+#endif
+#if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
+import SayAllSiriRemote
+#endif
+
+struct ButtonProfileHostAction: Equatable {
+    let id: String
+    let title: String
+    let detail: String?
+    let systemImage: String
+    let payload: Data
+    let isAvailable: Bool
+}
+
+struct ButtonProfileHostActionSection: Equatable {
+    let id: String
+    let title: String
+    let actions: [ButtonProfileHostAction]
+}
+
+final class MacroFeatureIntegration: ObservableObject {
+    @Published private(set) var isFeatureVisible = false
+    @Published private(set) var isButtonProfilesVisible = false
+    @Published private(set) var shouldShowEnrollment = false
+    @Published private(set) var isEditorActive = false
+    private var subscriptions = Set<AnyCancellable>()
+    private var enrollmentRevealRequested = false
+    private var isPortableEditorActive = false
+    private var isBindingEditorActive = false
+
+#if canImport(SayAllMacroRemoteMic)
+    private let feature: SayAllMacroRemoteMicFeature
+#endif
+#if canImport(SayAllButtonProfiles)
+    private let buttonProfilesFeature: SayAllButtonProfilesFeature
+#endif
+
+    init(localeIdentifier: String = Locale.current.identifier) {
+        #if canImport(SayAllMacroRemoteMic)
+        #if SAYALL_MACRO_HOST_SHORTCUTS
+        feature = SayAllMacroRemoteMicFeature(localeIdentifier: localeIdentifier, inputFocuser: {
+            try await KeyboardInjector.focusFrontmostComposerForMacro()
+        }, keyboardShortcutPerformer: {
+            Self.performKeyboardShortcut(keyCode: $0, modifiers: $1, deviceModifierFlags: $2)
+        }, diagnosticLogger: AppLogger.shared.write)
+        #elseif SAYALL_MACRO_INPUT_FOCUS
+        feature = SayAllMacroRemoteMicFeature(localeIdentifier: localeIdentifier, inputFocuser: {
+            try await KeyboardInjector.focusFrontmostComposerForMacro()
+        }, diagnosticLogger: AppLogger.shared.write)
+        #else
+        feature = SayAllMacroRemoteMicFeature(localeIdentifier: localeIdentifier, diagnosticLogger: AppLogger.shared.write)
+        #endif
+        #endif
+#if canImport(SayAllButtonProfiles)
+        #if SAYALL_MACRO_HOST_SHORTCUTS
+        buttonProfilesFeature = SayAllButtonProfilesFeature(
+            localeIdentifier: localeIdentifier, keyboardShortcutPerformer: {
+                Self.performKeyboardShortcut(keyCode: $0, modifiers: $1, deviceModifierFlags: $2)
+            }, diagnosticLogger: AppLogger.shared.write
+        )
+        #else
+        buttonProfilesFeature = SayAllButtonProfilesFeature(
+            localeIdentifier: localeIdentifier,
+            diagnosticLogger: AppLogger.shared.write
+        )
+        #endif
+        #if SAYALL_TEST_BUTTON_PROFILES_FREE
+        // 本地测试包没有会员模块，默认决策会让按键方案整页只读（去编辑点了没反应）。
+        buttonProfilesFeature.updateButtonProfilesAccess(.allowed(validUntil: .distantFuture))
+        #endif
+#endif
+        #if canImport(SayAllMacroRemoteMic)
+        feature.$isFeatureVisible
+            .removeDuplicates()
+            .assign(to: &$isFeatureVisible)
+        feature.$shouldShowEnrollment
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self else { return }
+                self.shouldShowEnrollment = value || self.enrollmentRevealRequested
+            }
+            .store(in: &subscriptions)
+        #endif
+#if canImport(SayAllButtonProfiles)
+        isButtonProfilesVisible = true
+        buttonProfilesFeature.$isButtonProfileBindingEditorActive
+            .removeDuplicates()
+            .sink { [weak self] active in
+                self?.setEditorActive(active)
+            }
+            .store(in: &subscriptions)
+#endif
+    }
+
+    #if canImport(SayAllMacroRemoteMic) && SAYALL_MACRO_HOST_SHORTCUTS
+    static func performKeyboardShortcut(
+        keyCode: UInt16, modifiers: [String], deviceModifierFlags: UInt64,
+        accessibilityTrusted: () -> Bool = { KeyboardInjector.isAccessibilityTrusted },
+        shortcutSender: (CustomKeyboardShortcut) -> Bool = {
+            KeyboardInjector.send(.customShortcut, shortcut: $0)
+        }
+    ) -> MacroActionExecutionOutcome {
+        guard let shortcut = KeyboardInjector.recordedShortcut(
+            keyCode: keyCode, modifiers: modifiers, deviceModifierFlags: deviceModifierFlags
+        ) else { return .failed("快捷键配置无效") }
+        guard accessibilityTrusted() else {
+            return .permissionDenied("需要辅助功能权限")
+        }
+        return shortcutSender(shortcut)
+            ? .userResultUnknown("快捷键已提交，目标App结果未知") : .failed("快捷键投递失败")
+    }
+    #endif
+
+    var hasPendingPortableImport: Bool {
+        #if canImport(SayAllMacroRemoteMic)
+        return feature.portableTransfer.hasPendingImport
+        #else
+        return false
+        #endif
+    }
+
+    var libraryActions: [ButtonLibraryAction] {
+        #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        feature.libraryActions.map { ButtonLibraryAction(id: $0.id, name: $0.name, stepCount: $0.stepCount) }
+        #else
+        []
+        #endif
+    }
+
+    func mappingProfiles(device: UUID?) -> [ButtonMappingProfile] {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.profiles(for: device).map { ButtonMappingProfile(id: $0.id, name: buttonProfilesFeature.profileDisplayName($0)) }
+        #else
+        []
+        #endif
+    }
+
+    func prepareMappingDevice(_ device: UUID?) {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.prepareMappingDevice(device)
+        #endif
+    }
+
+    func activeMappingProfileID(device: UUID?) -> UUID? {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.activeProfileID(for: device)
+        #else
+        nil
+        #endif
+    }
+
+    /// 键位方案只能覆盖 10 个普通按键；组件版本不支持该查询时一律按“不支持”处理，
+    /// 由按键页保持只读基础映射的现有行为。
+    func supportsProfileButton(_ button: String) -> Bool {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.supportsProfileButton(button)
+        #else
+        false
+        #endif
+    }
+
+    /// 默认方案继承基础映射且拒绝写入，按键页需要据此隐藏或禁用编辑。
+    func isMappingProfileEditable(_ profile: UUID?) -> Bool {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.isButtonProfileEditable(profile: profile)
+        #else
+        false
+        #endif
+    }
+
+    /// 键位方案现在能不能写。
+    ///
+    /// 读私有组件自己的访问判定，而不是宿主会员模块那一份：方案列表就是按它过滤的
+    /// （无权限时直接返回空），本地测试构建还会用 `SAYALL_TEST_BUTTON_PROFILES_FREE`
+    /// 把访问放开。两边读同一个值，才不会出现「列表里有方案，点「编辑」却只弹开通会员」
+    /// 或者「点了完全没反应」这类看起来像故障的状态。
+    var canUseMappingProfiles: Bool {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.buttonProfilesAccessDecision.permitsAccess
+        #else
+        // 没有私有组件就没有方案，也就没有可拦的写入。
+        true
+        #endif
+    }
+
+    /// 「保存为键位方案」先建空方案，再逐条写入当前基础映射。
+    func createMappingProfile(named name: String) -> UUID? {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        buttonProfilesFeature.createProfile(named: name)
+        #else
+        nil
+        #endif
+    }
+
+    /// 写入中途失败时回滚刚创建的方案。
+    func deleteMappingProfile(_ profile: UUID) {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        _ = buttonProfilesFeature.deleteProfile(profile)
+        #endif
+    }
+
+    var supportsProfileHoldModes: Bool {
+        #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_HOLD_MODES
+        true
+        #else
+        false
+        #endif
+    }
+
+    func profileHoldMode(profile: UUID? = nil, button: RemoteButton) -> String? {
+        #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_HOLD_MODES
+        buttonProfilesFeature.holdMode(profile: profile, button: button.rawValue)
+        #else
+        nil
+        #endif
+    }
+
+    func setProfileHoldMode(_ mode: RemoteButtonHoldMode, profile: UUID, button: RemoteButton) {
+        #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_HOLD_MODES
+        buttonProfilesFeature.setHoldMode(mode.rawValue, profile: profile, button: button.rawValue)
+        objectWillChange.send()
+        #endif
+    }
+
+    func profileBinding(device: UUID?, profile: UUID? = nil, button: RemoteButton,
+                        trigger: ButtonTrigger) -> ConfiguredButtonAction? {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        guard let binding = buttonProfilesFeature.binding(device: device, profile: profile,
+            button: button.rawValue, trigger: trigger.rawValue) else { return nil }
+        switch binding {
+        case let .host(reference):
+            // Corrupt or unknown explicit bindings are consumed, never inherited.
+            return (try? JSONDecoder().decode(ConfiguredButtonAction.self, from: reference.payload)) ?? .disabled
+        case let .macro(reference):
+            return ConfiguredButtonAction(action: .combinationAction, shortcut: nil, macroID: reference.macroID)
+        case let .shortcut(key):
+            guard let shortcut = buttonProfilesFeature.shortcut(id: key) else { return .disabled }
+            var flags = NSEvent.ModifierFlags(rawValue: UInt(shortcut.deviceModifierFlags ?? 0))
+            for modifier in shortcut.modifiers {
+                switch modifier {
+                case "command": flags.insert(.command)
+                case "shift": flags.insert(.shift)
+                case "option": flags.insert(.option)
+                case "control": flags.insert(.control)
+                case "function": flags.insert(.function)
+                default: return .disabled
+                }
+            }
+            #if SAYALL_BUTTON_PROFILE_BINDING_TEXT
+            // 私有组件提供真实键名；缺了它按键页只会显示修饰键符号。
+            let keyLabel = buttonProfilesFeature.shortcutLabel(id: key) ?? ""
+            #else
+            let keyLabel = ""
+            #endif
+            return ConfiguredButtonAction(action: .customShortcut,
+                shortcut: CustomKeyboardShortcut(keyCode: shortcut.keyCode, modifierFlags: flags, keyLabel: keyLabel))
+        case .focus:
+            return ConfiguredButtonAction(action: .focusInput, shortcut: nil)
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    /// 截图/测试用：渲染前同步载入方案。
+    ///
+    /// `SettingsView` 的 `onAppear` 会调用 `prepareMappingDevice`，而它在未加载时
+    /// 会创建默认方案并立刻保存，把磁盘上已有方案冲掉。先同步载入即可避免。
+    func loadProfilesForScreenshot() {
+        #if canImport(SayAllButtonProfiles) && SAYALL_SCREENSHOT_PROFILE_SEED
+        try? buttonProfilesFeature.loadProfilesSynchronously()
+        #endif
+    }
+
+    /// 方案绑定的显示文案，与键位方案页共用私有组件里同一份格式化结果。
+    ///
+    /// 返回 nil 有两种含义，调用方都应当回落到基础映射：
+    /// 方案没有覆盖这个按键，或私有组件还没提供这套 API。
+    func profileBindingText(device: UUID?, profile: UUID? = nil, button: RemoteButton,
+                            trigger: ButtonTrigger) -> (compact: String, detailed: String)? {
+        #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_PROFILE_BINDING_TEXT
+        guard let resolved = buttonProfilesFeature.resolvedBindingText(
+            profile: profile, button: button.rawValue, trigger: trigger.rawValue
+        ) else { return nil }
+        return (resolved.text.compact, resolved.text.detailed)
+        #else
+        return nil
+        #endif
+    }
+
+    func setProfileBinding(_ configured: ConfiguredButtonAction?, profile: UUID,
+                           button: RemoteButton, trigger: ButtonTrigger, displayName: String? = nil) {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        let binding: RemoteMicButtonProfileBinding?
+        if let configured {
+            if configured.action == .combinationAction, let id = configured.macroID,
+               let version = feature.savedMacroVersion(id: id) {
+                binding = .macro(MacroReference(macroID: id, version: version))
+            } else {
+                guard let data = try? JSONEncoder().encode(configured) else { return }
+                binding = .host(RemoteMicHostActionReference(id: "host.action.\(configured.action.rawValue)",
+                    displayName: displayName ?? configured.action.rawValue, payload: data))
+            }
+        } else { binding = nil }
+        buttonProfilesFeature.setBinding(binding, profile: profile, button: button.rawValue, trigger: trigger.rawValue)
+        #endif
+    }
+
+    func executeMacro(id: String?) -> Bool {
+        #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        guard let id else { return false }
+        let accepted = feature.executeMacro(id: id)
+        AppLogger.shared.write("BUTTON ACTION phase=\(accepted ? "submitted" : "failed") result=\(accepted ? "accepted" : "unavailable_or_busy")")
+        return accepted
+        #else
+        return false
+        #endif
+    }
+
+    func configurePortableTransfer(settings: AppSettings, beforeApply: @escaping (Data) throws -> Void) {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.onMacroDeleted = { [weak self, weak settings] macroID in
+            settings?.removeMacroReferences(to: macroID)
+            #if canImport(SayAllButtonProfiles)
+            _ = self?.buttonProfilesFeature.removeMacroReferences(to: macroID) { [weak settings] payload in
+                guard let settings,
+                      let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: payload)
+                else { return false }
+                return configured.action == .combinationAction && configured.macroID == macroID
+            }
+            #endif
+        }
+        #if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.onMacroDeleted = { [weak self, weak settings] macroID in
+            settings?.removeMacroReferences(to: macroID)
+            _ = self?.buttonProfilesFeature.removeMacroReferences(to: macroID) { payload in
+                guard let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: payload)
+                else { return false }
+                return configured.action == .combinationAction && configured.macroID == macroID
+            }
+        }
+        #endif
+        feature.portableTransfer.hostAdapter = settings.portableHostAdapter(beforeApply: beforeApply)
+        feature.portableTransfer.validateConfigurationHostAction = AppSettings.validateConfigurationAction
+        #if SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        feature.portableTransfer.exportMacroBindings = nil
+        feature.portableTransfer.prepareMacroBindings = nil
+        #endif
+        feature.portableTransfer.$isPresenting.sink { [weak self] active in
+            guard let self else { return }
+            self.isPortableEditorActive = active
+            self.isEditorActive = active || self.isBindingEditorActive
+        }.store(in: &subscriptions)
+        feature.portableTransfer.logEvent = { AppLogger.shared.write($0) }
+        #if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.configurePortableTransfer(feature.portableTransfer)
+        #endif
+        do { try feature.portableTransfer.recover() }
+        catch { AppLogger.shared.write("TRANSFER RECOVERY phase=failed result=recovery_required") }
+        #endif
+    }
+
+    func portableTransferView(profileID: UUID?, model: XiaomiRemoteModel?, applicationsOnly: Bool = false) -> AnyView {
+        #if canImport(SayAllMacroRemoteMic)
+        return feature.portableTransferView(selectedRemoteProfileID: profileID,
+            remoteModel: AppSettings.portableRemoteModel(model), applicationsOnly: applicationsOnly)
+        #else
+        return AnyView(EmptyView())
+        #endif
+    }
+
+    func configurationTransferView(profileID: UUID?, model: XiaomiRemoteModel?) -> AnyView {
+        #if canImport(SayAllMacroRemoteMic)
+        return AnyView(RemoteMicPortableTransferView(controller: feature.portableTransfer,
+            remoteProfileID: profileID, remoteModel: AppSettings.portableRemoteModel(model),
+            defaultKinds: [.macro, .application, .buttonProfile, .hostSettings],
+            showsEntryButtons: false, defaultExportPurpose: .personalBackup))
+        #else
+        return AnyView(EmptyView())
+        #endif
+    }
+
+    func exportedCompleteConfigurationData(settings: AppSettings) throws -> Data {
+        #if canImport(SayAllMacroRemoteMic)
+        let components = try feature.portableTransfer.exportConfigurationArchive()
+        #else
+        let components: Data? = nil
+        #endif
+        return try MacConfigurationBackup(host: settings.completeConfigurationSnapshot(), components: components)
+            .encoded(version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.0.0",
+                build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development")
+    }
+
+    func validateConfigurationArchive(_ data: Data?) throws {
+        guard let data else { return }
+        #if canImport(SayAllMacroRemoteMic)
+        try feature.portableTransfer.validateConfigurationArchive(data)
+        #else
+        throw AppConfigurationError.unsupportedVersion
+        #endif
+    }
+
+    func restoreConfigurationArchive(_ data: Data?, hostAfter: Data) throws -> Bool {
+        #if canImport(SayAllMacroRemoteMic)
+        // A backup without private modules must not leave unrelated existing actions active.
+        try feature.portableTransfer.restoreConfigurationArchive(data ?? Data("{}".utf8), hostAfter: hostAfter)
+        return true
+        #else
+        guard data == nil else { throw AppConfigurationError.unsupportedVersion }
+        return false
+        #endif
+    }
+
+    func requestConfigurationImport(from url: URL) -> Bool {
+        #if canImport(SayAllMacroRemoteMic)
+        guard url.pathExtension.lowercased() == "sayall" else { return false }
+        feature.portableTransfer.requestedOperation = .importFile(url,
+            scope: [.macro, .application, .buttonProfile, .hostSettings])
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    func requestButtonProfileImport(from url: URL) -> Bool {
+        #if canImport(SayAllMacroRemoteMic) && canImport(SayAllButtonProfiles)
+        guard url.isFileURL, url.pathExtension.lowercased() == "sayall" else { return false }
+        feature.portableTransfer.requestedOperation = .importFile(url, scope: [.buttonProfile])
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    func attachBindings(to settings: AppSettings, onProfileChange: @escaping (UUID?) -> Void) {
+        settings.interactionModeOverride = { [weak self, weak settings] _, button in
+            guard settings?.customMappingEnabled == true else { return nil }
+            return self?.profileHoldMode(button: button)
+        }
+        settings.configuredActionOverride = { [weak self, weak settings] device, button, trigger in
+            guard let settings, settings.customMappingEnabled else { return nil }
+            return self?.profileBinding(device: device, button: button, trigger: trigger)
+        }
+        #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        feature.executionEvents.receive(on: DispatchQueue.main).sink { event in
+            AppLogger.shared.write("MACRO ACTION operation_id=\(event.0) phase=\(event.1) result=\(event.2) elapsed_ms=\(event.3)")
+        }.store(in: &subscriptions)
+        feature.changes.receive(on: DispatchQueue.main).sink { [weak self, weak settings] in
+            guard let self, let settings else { return }
+            DispatchQueue.main.async {
+                self.migrateLegacyBindingsIfLoaded(to: settings)
+                self.objectWillChange.send()
+            }
+        }.store(in: &subscriptions)
+        // The controller can finish its initial read before this subscription is installed.
+        // Check the already-loaded state so migration does not depend on timing.
+        migrateLegacyBindingsIfLoaded(to: settings)
+        #endif
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        var lastActiveProfiles: [UUID?: UUID] = [:]
+        var lastProfileBindings: [UUID?: [RemoteMicButtonProfile]] = [:]
+        buttonProfilesFeature.changes.receive(on: DispatchQueue.main).sink { [weak self, weak settings] in
+            DispatchQueue.main.async {
+                guard let self, let settings else { return }
+                let devices: [UUID?] = [nil] + settings.remoteDeviceProfiles.map { Optional($0.id) }
+                for device in devices {
+                    let active = self.activeMappingProfileID(device: device)
+                    let profiles = self.buttonProfilesFeature.profiles(for: device)
+                    if active != lastActiveProfiles[device] || profiles != lastProfileBindings[device] {
+                        lastActiveProfiles[device] = active
+                        lastProfileBindings[device] = profiles
+                        onProfileChange(device)
+                    }
+                }
+                self.objectWillChange.send()
+                settings.objectWillChange.send()
+            }
+        }.store(in: &subscriptions)
+        #endif
+    }
+
+    #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+    private func migrateLegacyBindingsIfLoaded(to settings: AppSettings) {
+        guard feature.hasLoadedLibrary else { return }
+        let legacy = feature.legacyBindings.compactMap { value -> UnifiedButtonBinding? in
+            guard let button = RemoteButton(rawValue: value.button),
+                  let trigger = ButtonTrigger(rawValue: value.trigger) else { return nil }
+            return UnifiedButtonBinding(
+                remoteProfileID: value.device,
+                button: button,
+                trigger: trigger,
+                configured: ConfiguredButtonAction(
+                    action: .combinationAction,
+                    shortcut: nil,
+                    macroID: value.macroID
+                )
+            )
+        }
+        do { try settings.migrateLegacyMacroBindings(legacy) }
+        catch { AppLogger.shared.write("BUTTON CONFIGURATION phase=failed result=migration_backup_failed") }
+    }
+    #endif
+
+    #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+    private func bindingUsages(_ settings: AppSettings) -> [RemoteMicBindingUsage] {
+        let localization = LocalizationStore(settings: settings)
+        func deviceName(_ id: UUID?) -> String {
+            guard let profile = settings.remoteDeviceProfiles.first(where: { $0.id == id }) else {
+                return localization.text("button_mapping.base_profile")
+            }
+            return RemoteDeviceNamePolicy.displayName(for: profile, among: settings.remoteDeviceProfiles,
+                defaultName: localization.text(profile.displayNameFallbackKey))
+        }
+        var usages = settings.unifiedBaseBindings.compactMap { binding -> RemoteMicBindingUsage? in
+            guard binding.configured.action == .combinationAction, let id = binding.configured.macroID else { return nil }
+            return RemoteMicBindingUsage(
+                id: "base.\(binding.remoteProfileID?.uuidString ?? "default").\(binding.button.rawValue).\(binding.trigger.rawValue)",
+                macroID: id, title: deviceName(binding.remoteProfileID) + " · " + localization.text("button_mapping.base_profile") + " · " + binding.button.displayName(using: localization) + " · " + binding.trigger.displayName(using: localization),
+                device: binding.remoteProfileID, profile: nil, button: binding.button.rawValue, trigger: binding.trigger.rawValue)
+        }
+        func appendLegacy(_ bindings: [RemoteButton: [ButtonTrigger: ConfiguredButtonAction]], device: UUID?) {
+            for (button, triggers) in bindings {
+                for (trigger, configured) in triggers {
+                    guard configured.action == .combinationAction, let id = configured.macroID,
+                          !usages.contains(where: { $0.device == device && $0.profile == nil && $0.button == button.rawValue && $0.trigger == trigger.rawValue && $0.macroID == id })
+                    else { continue }
+                    usages.append(RemoteMicBindingUsage(
+                        id: "secondary.\(device?.uuidString ?? "default").\(button.rawValue).\(trigger.rawValue).\(id)",
+                        macroID: id, title: deviceName(device) + " · " + localization.text("button_mapping.base_profile") + " · " + button.displayName(using: localization) + " · " + trigger.displayName(using: localization),
+                        device: device, profile: nil, button: button.rawValue, trigger: trigger.rawValue))
+                }
+            }
+        }
+        appendLegacy(settings.secondaryButtonBindings, device: settings.selectedRemoteProfileID)
+        for profile in settings.remoteDeviceProfiles {
+            appendLegacy(profile.mappings.parsedSecondaryButtonBindings, device: profile.id)
+        }
+        #if canImport(SayAllButtonProfiles)
+        for profile in buttonProfilesFeature.allProfiles {
+            for (key, binding) in profile.bindings {
+                let id: String?
+                switch binding {
+                case let .macro(reference): id = reference.macroID
+                case let .host(reference):
+                    let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: reference.payload)
+                    id = configured?.action == .combinationAction ? configured?.macroID : nil
+                case .shortcut, .focus: id = nil
+                }
+                guard let id else { continue }
+                usages.append(RemoteMicBindingUsage(id: "\(profile.id).\(key.button.rawValue).\(key.trigger.rawValue)",
+                    macroID: id, title: deviceName(profile.remoteProfileID) + " · " + buttonProfilesFeature.profileDisplayName(profile) + " · " + (RemoteButton(rawValue: key.button.rawValue)?.displayName(using: localization) ?? key.button.rawValue) + " · " + (ButtonTrigger(rawValue: key.trigger.rawValue)?.displayName(using: localization) ?? key.trigger.rawValue),
+                    device: profile.remoteProfileID, profile: profile.id, button: key.button.rawValue, trigger: key.trigger.rawValue))
+            }
+        }
+        #endif
+        // Keep legacy private-package bindings visible until they are migrated or cleaned.
+        // Unified bindings with the same physical key already represent the active entry.
+        let unifiedKeys = Set(usages.filter { $0.profile == nil }.map { "\($0.device?.uuidString ?? "default")|\($0.button)|\($0.trigger)|\($0.macroID)" })
+        for legacy in feature.legacyBindings {
+            let key = "\(legacy.device?.uuidString ?? "default")|\(legacy.button)|\(legacy.trigger)|\(legacy.macroID)"
+            guard !unifiedKeys.contains(key) else { continue }
+            let buttonTitle = RemoteButton(rawValue: legacy.button)?.displayName(using: localization) ?? legacy.button
+            let triggerTitle = ButtonTrigger(rawValue: legacy.trigger)?.displayName(using: localization) ?? legacy.trigger
+            usages.append(RemoteMicBindingUsage(
+                id: "legacy.\(legacy.device?.uuidString ?? "default").\(legacy.button).\(legacy.trigger)",
+                macroID: legacy.macroID,
+                title: localization.text("settings.section.macros") + " · " + deviceName(legacy.device) + " · " + buttonTitle + " · " + triggerTitle,
+                device: legacy.device, profile: nil, button: legacy.button, trigger: legacy.trigger))
+        }
+        return usages.sorted { $0.id < $1.id }
+    }
+    #endif
+
+    var sectionTitle: String {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.sectionTitle
+        #else
+        ""
+        #endif
+    }
+
+    var sectionSystemImage: String {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.sectionSystemImage
+        #else
+        "command.square"
+        #endif
+    }
+
+    var buttonProfilesSectionTitle: String {
+        #if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.buttonProfilesSectionTitle
+        #else
+        ""
+        #endif
+    }
+
+    var buttonProfilesSectionSystemImage: String {
+        #if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.buttonProfilesSectionSystemImage
+        #else
+        "rectangle.3.group"
+        #endif
+    }
+
+    func updateLocaleIdentifier(_ identifier: String) {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.updateLocaleIdentifier(identifier)
+        objectWillChange.send()
+        #endif
+        #if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.updateLocaleIdentifier(identifier)
+        objectWillChange.send()
+        #endif
+    }
+
+    func refreshAccessIfNeeded(force: Bool = false) {
+#if canImport(SayAllMacroRemoteMic)
+        feature.refreshAccessIfNeeded(force: force)
+#endif
+#if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.refreshAccessIfNeeded(force: force)
+#endif
+    }
+
+    func updateButtonProfilesAccess(_ decision: HostButtonProfilesAccessDecision) {
+        #if canImport(SayAllButtonProfiles)
+        #if SAYALL_TEST_BUTTON_PROFILES_FREE
+        buttonProfilesFeature.updateButtonProfilesAccess(
+            .allowed(validUntil: .distantFuture)
+        )
+        #else
+        let packageDecision: ButtonProfilesAccessDecision
+        switch decision {
+        case let .allowed(validUntil):
+            packageDecision = .allowed(validUntil: validUntil)
+        case let .temporarilyOffline(validUntil):
+            packageDecision = .temporarilyOffline(validUntil: validUntil)
+        case .authorized:
+            #if SAYALL_PROFILES_AUTHORIZED_ACCESS
+            packageDecision = .authorized
+            #else
+            packageDecision = .unavailable
+            #endif
+        case .requiresPlus:
+            packageDecision = .requiresPlus
+        case .unavailable:
+            packageDecision = .unavailable
+        }
+        buttonProfilesFeature.updateButtonProfilesAccess(packageDecision)
+        #endif
+        #endif
+    }
+
+    func setEditorActive(_ active: Bool) {
+        isBindingEditorActive = active && (isFeatureVisible || isButtonProfilesVisible)
+        isEditorActive = isBindingEditorActive || isPortableEditorActive
+    }
+
+    func activeButtonProfileTitle(
+        remoteProfileID: UUID?,
+        button: String,
+        trigger: String
+    ) -> String? {
+        #if canImport(SayAllButtonProfiles)
+        return buttonProfilesFeature.activeBindingDisplayName(
+            remoteProfileID: remoteProfileID,
+            button: button,
+            trigger: trigger
+        )
+        #else
+        return nil
+        #endif
+    }
+
+    var buttonProfileChanges: AnyPublisher<Void, Never> {
+        #if canImport(SayAllButtonProfiles)
+        return buttonProfilesFeature.changes
+        #else
+        return Empty().eraseToAnyPublisher()
+        #endif
+    }
+
+    func revealEnrollment() {
+#if canImport(SayAllMacroRemoteMic)
+        enrollmentRevealRequested = true
+        shouldShowEnrollment = true
+#endif
+    }
+
+    func settingsView(
+        selectedRemoteProfileID: UUID?,
+        remoteModel: XiaomiRemoteModel?,
+        configuredActionTitle: @escaping (String, String) -> String?,
+        settings: AppSettings? = nil,
+        onEditBinding: @escaping (UUID?, UUID?, RemoteButton, ButtonTrigger) -> Void = { _, _, _, _ in },
+        onBindToButton: @escaping () -> Void = {}
+    ) -> AnyView {
+        #if SAYALL_UNIFIED_BUTTON_CONFIGURATION && canImport(SayAllMacroRemoteMic)
+        #if SAYALL_MACRO_MISSING_BINDING_CLEANUP
+        return feature.settingsView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            remotePresentation: combinationActionsRemotePresentation(for: remoteModel),
+            configuredActionTitle: configuredActionTitle,
+            usages: settings.map(bindingUsages) ?? [],
+            onEditBinding: { usage in
+                guard let button = RemoteButton(rawValue: usage.button),
+                      let trigger = ButtonTrigger(rawValue: usage.trigger) else { return }
+                onEditBinding(usage.device, usage.profile, button, trigger)
+            },
+            onBindToButton: onBindToButton,
+            onRemoveMissingBindings: { [weak self] usages in
+                guard let self, let settings else { return false }
+                #if canImport(SayAllButtonProfiles)
+                guard self.buttonProfilesFeature.canCleanMacroReferences else { return false }
+                #endif
+                guard !settings.corruptedSettingKeys.contains("unifiedBaseBindings") else { return false }
+                let macroIDs = Set(usages.map(\.macroID))
+                for macroID in macroIDs {
+                    settings.removeMacroReferences(to: macroID)
+                    _ = self.feature.removeMacroReferences(to: macroID)
+                    #if canImport(SayAllButtonProfiles)
+                    _ = self.buttonProfilesFeature.removeMacroReferences(to: macroID) { payload in
+                        guard let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: payload)
+                        else { return false }
+                        return configured.action == .combinationAction && configured.macroID == macroID
+                    }
+                    #endif
+                }
+                let remaining = self.bindingUsages(settings).contains { macroIDs.contains($0.macroID) }
+                    || self.feature.legacyBindings.contains { macroIDs.contains($0.macroID) }
+                return !remaining
+            })
+        #else
+        return feature.settingsView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            remotePresentation: combinationActionsRemotePresentation(for: remoteModel),
+            configuredActionTitle: configuredActionTitle,
+            usages: settings.map(bindingUsages) ?? [],
+            onEditBinding: { usage in
+                guard let button = RemoteButton(rawValue: usage.button),
+                      let trigger = ButtonTrigger(rawValue: usage.trigger) else { return }
+                onEditBinding(usage.device, usage.profile, button, trigger)
+            },
+            onBindToButton: onBindToButton)
+        #endif
+        #else
+
+        #if canImport(SayAllMacroRemoteMic)
+        #if SAYALL_MACRO_REMOTE_CAPABILITIES
+        feature.settingsView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            remotePresentation: combinationActionsRemotePresentation(for: remoteModel),
+            configuredActionTitle: configuredActionTitle,
+            onBindingEditorActivityChanged: { [weak self] active in
+                self?.setEditorActive(active)
+            }
+        )
+        #else
+        feature.settingsView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            configuredActionTitle: configuredActionTitle,
+            onBindingEditorActivityChanged: { [weak self] active in
+                self?.setEditorActive(active)
+            }
+        )
+        #endif
+        #else
+        AnyView(EmptyView())
+        #endif
+        #endif
+    }
+
+    func enrollmentView() -> AnyView {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.enrollmentView()
+        #else
+        AnyView(EmptyView())
+        #endif
+    }
+
+    func buttonProfilesView(
+        selectedRemoteProfileID: UUID?,
+        remoteModel: XiaomiRemoteModel?,
+        hostActionSections: [ButtonProfileHostActionSection],
+        settings: AppSettings? = nil,
+        holdSummaryProvider: ((UUID, String) -> String)? = nil,
+        onChooseApplication: ((@escaping (String) -> Void) -> Void)? = nil,
+        onEditKeys: @escaping (UUID) -> Void = { _ in },
+        onChooseCustomApplication: ((@escaping (String, String, Data) -> Void) -> Void)? = nil,
+        chromecastReservedControlIDs: Set<String> = ["left", "right", "select"],
+        membershipNotice: AnyView = AnyView(EmptyView())
+    ) -> AnyView {
+        #if canImport(SayAllButtonProfiles)
+        #if SAYALL_MACRO_REMOTE_CAPABILITIES
+        return buttonProfilesFeature.buttonProfilesView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            remotePresentation: buttonProfilesRemotePresentation(for: remoteModel, chromecastReservedControlIDs: chromecastReservedControlIDs),
+            hostActionSections: hostActionSections.map { section in
+                RemoteMicHostActionSection(
+                    id: section.id,
+                    title: section.title,
+                    actions: section.actions.map { action in
+                        RemoteMicHostActionDescriptor(
+                            reference: RemoteMicHostActionReference(
+                                id: action.id,
+                                displayName: action.title,
+                                payload: action.payload
+                            ),
+                            detail: action.detail,
+                            systemImage: action.systemImage,
+                            isAvailable: action.isAvailable
+                        )
+                    }
+                )
+            },
+            baseBindingSummaries: settings.map { baseBindingSummaries($0, remoteProfileID: selectedRemoteProfileID) } ?? [],
+            holdSummaryProvider: holdSummaryProvider,
+            onChooseApplication: onChooseApplication,
+            onEditKeys: onEditKeys,
+            membershipNotice: membershipNotice,
+            onChooseCustomApplication: onChooseCustomApplication.map { callback in
+                { completion in
+                    callback { id, displayName, payload in
+                        completion(RemoteMicHostActionReference(
+                            id: id,
+                            displayName: displayName,
+                            payload: payload
+                        ))
+                    }
+                }
+            }
+        )
+        #else
+        return buttonProfilesFeature.buttonProfilesView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            hostActionSections: hostActionSections.map { section in
+                RemoteMicHostActionSection(
+                    id: section.id,
+                    title: section.title,
+                    actions: section.actions.map { action in
+                        RemoteMicHostActionDescriptor(
+                            reference: RemoteMicHostActionReference(
+                                id: action.id,
+                                displayName: action.title,
+                                payload: action.payload
+                            ),
+                            detail: action.detail,
+                            systemImage: action.systemImage,
+                            isAvailable: action.isAvailable
+                        )
+                    }
+                )
+            },
+            baseBindingSummaries: settings.map { baseBindingSummaries($0, remoteProfileID: selectedRemoteProfileID) } ?? [],
+            holdSummaryProvider: holdSummaryProvider,
+            onChooseApplication: onChooseApplication,
+            onEditKeys: onEditKeys,
+            onChooseCustomApplication: onChooseCustomApplication.map { callback in
+                { completion in
+                    callback { id, displayName, payload in
+                        completion(RemoteMicHostActionReference(
+                            id: id,
+                            displayName: displayName,
+                            payload: payload
+                        ))
+                    }
+                }
+            }
+        )
+        #endif
+        #else
+        return AnyView(EmptyView())
+        #endif
+    }
+
+    #if canImport(SayAllButtonProfiles) && canImport(SayAllMacroRemoteMic)
+    private func baseBindingSummaries(
+        _ settings: AppSettings,
+        remoteProfileID: UUID?
+    ) -> [SayAllButtonProfiles.RemoteMicBaseBindingSummary] {
+        let localization = LocalizationStore(settings: settings)
+        return SayAllButtonProfiles.RemoteMicButtonProfileContract.commonButtons.flatMap { profileButton in
+            guard let button = RemoteButton(rawValue: profileButton.rawValue) else {
+                return [SayAllButtonProfiles.RemoteMicBaseBindingSummary]()
+            }
+            return ButtonTrigger.allCases.compactMap { trigger in
+                let configured = settings.configuredBaseAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: remoteProfileID
+                )
+                guard configured.action != .disabled else { return nil }
+                return SayAllButtonProfiles.RemoteMicBaseBindingSummary(
+                    button: profileButton.rawValue,
+                    trigger: trigger.rawValue,
+                    displayName: baseBindingTitle(
+                        settings: settings,
+                        localization: localization,
+                        configured: configured
+                    )
+                )
+            }
+        }
+    }
+
+    private func baseBindingTitle(
+        settings: AppSettings,
+        localization: LocalizationStore,
+        configured: ConfiguredButtonAction
+    ) -> String {
+        if configured.action == .combinationAction {
+            return feature.libraryActions.first { $0.id == configured.macroID }?.name
+                ?? localization.text("button_mapping.macro_unavailable")
+        }
+        if configured.action == .customShortcut, let shortcut = configured.shortcut {
+            return shortcut.visualDisplayName(using: localization)
+        }
+        if configured.action == .openCustomApplication {
+            return settings.customApplicationProfile(id: configured.applicationProfileID)?.displayName
+                ?? localization.text("custom_application.not_configured")
+        }
+        // 与按键页、方案页共用同一套动作语义名，不再单独特判方向符号与音量短标签。
+        return configured.action.displayName(using: localization)
+    }
+    #endif
+
+    #if SAYALL_MACRO_REMOTE_CAPABILITIES && canImport(SayAllMacroRemoteMic)
+    private func combinationActionsRemotePresentation(
+        for model: XiaomiRemoteModel?
+    ) -> SayAllMacroRemoteMic.RemoteMicRemotePresentation {
+        switch model {
+        case .rc001:
+            return SayAllMacroRemoteMic.RemoteMicRemotePresentation.xiaomiRC001(displayName: "RC001")
+        case .rc003, .unknown, nil:
+            return SayAllMacroRemoteMic.RemoteMicRemotePresentation.xiaomiRC003(displayName: "RC003")
+        case .chromecastVoiceRemote:
+            #if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
+            let anchors = Dictionary(uniqueKeysWithValues: ChromecastMappingCanvas.placements.compactMap { placement in
+                RemoteMicMacroButton(rawValue: placement.controlID == "select" ? "ok" : placement.controlID)
+                    .map { ($0, placement.anchor) }
+            })
+            return RemoteMicRemotePresentation(
+                capabilities: RemoteMicRemoteModelCatalog.capabilities(for: RemoteMicRemoteModelID.chromecastVoiceRemote)!,
+                displayName: "Chromecast Voice Remote", image: ChromecastMappingCanvas.remoteImage,
+                aspectRatio: ChromecastMappingCanvas.remoteSize.width / ChromecastMappingCanvas.remoteSize.height,
+                anchors: anchors)
+            #else
+            return RemoteMicRemotePresentation(
+                capabilities: RemoteMicRemoteModelCatalog.capabilities(for: RemoteMicRemoteModelID.chromecastVoiceRemote)!,
+                displayName: "Chromecast Voice Remote", image: nil, aspectRatio: 155.0 / 510.0, anchors: [:])
+            #endif
+        case .appleSiriRemoteA2854, .appleSiriRemoteA2540:
+            #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
+            let siriModel: SayAllSiriRemoteModel = model == .appleSiriRemoteA2540
+                ? .a2540
+                : .a2854
+            let source = SayAllSiriRemoteDevicePresentation.presentation(for: siriModel)
+            let capabilities = SayAllMacroRemoteMic.RemoteMicRemoteModelCatalog.capabilities(
+                for: source.model.stableModelID
+            )!
+            let anchors = Dictionary(uniqueKeysWithValues: source.anchors.compactMap {
+                controlID, anchor in
+                combinationActionsMacroButton(forSiriControlID: controlID).map { ($0, anchor) }
+            })
+            return SayAllMacroRemoteMic.RemoteMicRemotePresentation(
+                capabilities: capabilities,
+                displayName: source.displayName,
+                image: source.image,
+                aspectRatio: source.aspectRatio,
+                anchors: anchors
+            )
+            #else
+            let modelID = model == .appleSiriRemoteA2540
+                ? SayAllMacroRemoteMic.RemoteMicRemoteModelID.appleSiriRemoteA2540
+                : SayAllMacroRemoteMic.RemoteMicRemoteModelID.appleSiriRemoteA2854
+            return SayAllMacroRemoteMic.RemoteMicRemotePresentation(
+                capabilities: SayAllMacroRemoteMic.RemoteMicRemoteModelCatalog.capabilities(for: modelID)!,
+                displayName: "Siri Remote",
+                image: nil,
+                aspectRatio: 423.0 / 1510.0,
+                anchors: [:]
+            )
+            #endif
+        }
+    }
+
+    private func combinationActionsMacroButton(
+        forSiriControlID controlID: String
+    ) -> SayAllMacroRemoteMic.RemoteMicMacroButton? {
+        switch controlID {
+        case "power": .power
+        case "up": .up
+        case "left": .left
+        case "select": .ok
+        case "right": .right
+        case "down": .down
+        case "back": .back
+        case "tv": .tv
+        case "play_pause": .playPause
+        case "volume_up": .volumeUp
+        case "mute": .mute
+        case "volume_down": .volumeDown
+        default: nil
+        }
+    }
+
+    #if canImport(SayAllButtonProfiles)
+    private func buttonProfilesRemotePresentation(
+        for model: XiaomiRemoteModel?,
+        chromecastReservedControlIDs: Set<String>
+    ) -> SayAllButtonProfiles.RemoteMicRemotePresentation {
+        let source = combinationActionsRemotePresentation(for: model)
+        guard model == .chromecastVoiceRemote else { return source }
+        let reserved = Set(chromecastReservedControlIDs.compactMap {
+            RemoteMicMacroButton(rawValue: $0 == "select" ? "ok" : $0)
+        })
+        return RemoteMicRemotePresentation(
+            capabilities: RemoteMicRemoteCapabilities(modelID: source.capabilities.modelID,
+                configurableButtons: RemoteMicRemoteModelCatalog.chromecastButtons, reservedButtons: reserved),
+            displayName: source.displayName, image: source.image,
+            aspectRatio: source.aspectRatio, anchors: source.anchors)
+    }
+    #endif
+    #endif
+
+    func hasActiveBinding(profileID: UUID?, button: RemoteButton, trigger: ButtonTrigger) -> Bool {
+        #if SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        return false
+        #else
+        #if canImport(SayAllButtonProfiles)
+        if buttonProfilesFeature.hasActiveBinding(remoteProfileID: profileID, button: button.rawValue, trigger: trigger.rawValue) { return true }
+        #endif
+        #if canImport(SayAllMacroRemoteMic)
+        return feature.hasActiveBinding(remoteProfileID: profileID, button: button.rawValue, trigger: trigger.rawValue)
+        #else
+        return false
+        #endif
+        #endif
+    }
+
+    func noteButtonInteraction(button: RemoteButton) {
+#if canImport(SayAllMacroRemoteMic)
+        feature.noteButtonInteraction(button: button.rawValue)
+#endif
+#if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.noteButtonInteraction(button: button.rawValue)
+#endif
+    }
+
+    @discardableResult
+    func executeBoundMacro(
+        profileID: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        #if canImport(SayAllMacroRemoteMic)
+        feature.executeBoundMacro(
+            remoteProfileID: profileID,
+            button: button.rawValue,
+            trigger: trigger.rawValue
+        )
+        #else
+        false
+        #endif
+    }
+
+    @discardableResult
+    func executeBoundAction(profileID: UUID?, button: RemoteButton, trigger: ButtonTrigger,
+                           hostActionPerformer: (Data) -> Bool,
+                           shortcutPerformer: (UInt16, [String]) -> Bool,
+                            exactShortcutPerformer: ((UInt16,[String],UInt64) -> Bool)? = nil) -> Bool {
+        #if SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        return false
+        #else
+        #if canImport(SayAllButtonProfiles)
+        if buttonProfilesFeature.executeBoundAction(remoteProfileID: profileID, button: button.rawValue,
+            trigger: trigger.rawValue, hostActionPerformer: hostActionPerformer, shortcutPerformer: shortcutPerformer,
+            exactShortcutPerformer: exactShortcutPerformer) { return true }
+        #endif
+        return executeBoundMacro(profileID: profileID, button: button, trigger: trigger)
+        #endif
+    }
+
+    func stop() {
+#if canImport(SayAllMacroRemoteMic)
+        feature.stop()
+#endif
+#if canImport(SayAllButtonProfiles)
+        buttonProfilesFeature.stop()
+#endif
+    }
+}

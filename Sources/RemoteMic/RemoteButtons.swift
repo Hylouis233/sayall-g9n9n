@@ -1,0 +1,1217 @@
+import AppKit
+import Foundation
+import IOKit.hidsystem
+
+enum RemoteButton: String, CaseIterable, Codable, Identifiable {
+    case power
+    case up
+    case left
+    case ok
+    case right
+    case down
+    case back
+    case volumeUp = "volume_up"
+    case home
+    case volumeDown = "volume_down"
+    case menu
+    case tv
+    case playPause = "play_pause"
+    case mute
+    /// Chromecast 遥控器专有按键。这三颗键在小米遥控器上不存在，因此不进 `xiaomiCases`。
+    case youtube
+    case netflix
+    case input
+
+    /// Buttons physically present on the Xiaomi RC001/RC003 layout.
+    /// Siri Remote has its own private page and does not use this list.
+    static let xiaomiCases: [RemoteButton] = [
+        .power, .up, .left, .ok, .right, .down, .back,
+        .volumeUp, .home, .volumeDown, .menu, .tv,
+    ]
+
+    var id: String { rawValue }
+
+    var hidUsage: UInt16 {
+        switch self {
+        case .power: return 0x66
+        case .up: return 0x52
+        case .left: return 0x50
+        case .ok: return 0x28
+        case .right: return 0x4F
+        case .down: return 0x51
+        case .back: return 0xF1
+        case .volumeUp: return 0x80
+        case .home: return 0x4A
+        case .volumeDown: return 0x81
+        case .menu: return 0x65
+        case .tv: return 0x35
+        // Reserved values: these controls are decoded by the Siri Remote
+        // adapter and are not part of Xiaomi HID discovery.
+        case .playPause: return 0x1000
+        case .mute: return 0x1001
+        // Reserved values: decoded by the Chromecast adapter's own HID channel
+        // (usage 0x0E/0x0F/0x11 in that remote's report), never by Xiaomi discovery.
+        case .youtube: return 0x1002
+        case .netflix: return 0x1003
+        case .input: return 0x1004
+        }
+    }
+
+    func shortLabel(using localization: LocalizationStore) -> String {
+        switch self {
+        case .power: return localization.text("remote.button.short.power")
+        case .up: return localization.text("remote.button.short.up")
+        case .left: return localization.text("remote.button.short.left")
+        case .ok: return "OK"
+        case .right: return localization.text("remote.button.short.right")
+        case .down: return localization.text("remote.button.short.down")
+        case .back: return localization.text("remote.button.short.back")
+        case .volumeUp: return "+"
+        case .home: return localization.text("remote.button.short.home")
+        case .volumeDown: return "−"
+        case .menu: return localization.text("remote.button.short.menu")
+        case .tv: return "TV"
+        case .playPause: return localization.text("remote.button.short.play_pause")
+        case .mute: return localization.text("remote.button.short.mute")
+        case .youtube: return "YouTube"
+        case .netflix: return "NETFLIX"
+        case .input: return localization.text("remote.button.short.input")
+        }
+    }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .power: return localization.text("remote.button.full.power")
+        case .up: return localization.text("remote.button.full.up")
+        case .left: return localization.text("remote.button.full.left")
+        case .ok: return localization.text("remote.button.full.ok")
+        case .right: return localization.text("remote.button.full.right")
+        case .down: return localization.text("remote.button.full.down")
+        case .back: return localization.text("remote.button.full.back")
+        case .volumeUp: return localization.text("remote.button.full.volume_up")
+        case .home: return localization.text("remote.button.full.home")
+        case .volumeDown: return localization.text("remote.button.full.volume_down")
+        case .menu: return localization.text("remote.button.full.menu")
+        case .tv: return localization.text("remote.button.full.tv")
+        case .playPause: return localization.text("remote.button.full.play_pause")
+        case .mute: return localization.text("remote.button.full.mute")
+        case .youtube: return localization.text("remote.button.full.youtube")
+        case .netflix: return localization.text("remote.button.full.netflix")
+        case .input: return localization.text("remote.button.full.input")
+        }
+    }
+
+    static let usageMap = Dictionary(
+        uniqueKeysWithValues: xiaomiCases.map { ($0.hidUsage, $0) }
+    )
+
+    static func buttons(for usages: Set<UInt16>) -> Set<RemoteButton> {
+        Set(usages.compactMap { usageMap[$0] })
+    }
+
+    var nativeEvent: RemoteNativeEvent? {
+        switch self {
+        case .ok: return .keyboard(keyCode: 36)
+        // The shared Xiaomi RC001/RC003 keyboard interface emits keyCode 10
+        // (ISO §) with flags 0x100 for the TV key.
+        // 50 was the historical value from the initial release and never
+        // matched the hardware, so the suppressor missed the real event.
+        case .tv: return .keyboard(keyCode: 10)
+        case .home: return .keyboard(keyCode: 115)
+        case .right: return .keyboard(keyCode: 124)
+        case .left: return .keyboard(keyCode: 123)
+        case .down: return .keyboard(keyCode: 125)
+        case .up: return .keyboard(keyCode: 126)
+        case .menu: return .keyboard(keyCode: 110)
+        case .power: return .keyboard(keyCode: 90)
+        case .volumeUp: return .systemKey(type: 0)
+        case .volumeDown: return .systemKey(type: 1)
+        case .back: return nil
+        case .playPause: return .systemKey(type: 2)
+        case .mute: return .systemKey(type: 3)
+        // Chromecast 的三颗专有键由私有包的 HID 通道独占读取：映射开启时设备被整个独占，
+        // 系统侧不会同时收到事件，因此不存在需要抑制的原生事件。
+        case .youtube, .netflix, .input: return nil
+        }
+    }
+
+    var nativeEvents: Set<RemoteNativeEvent> {
+        guard let nativeEvent else { return [] }
+        return self == .tv ? [nativeEvent, .keyboard(keyCode: 50)] : [nativeEvent]
+    }
+}
+
+/// 键位方案覆盖名单里的一项：四颗方向键合并成一项，其余按键逐颗列出。
+enum ButtonProfileScopeItem: Equatable, Hashable {
+    case directions
+    case button(RemoteButton)
+
+    /// 与按键页卡片保持同一套图标，识别方式不因文案而改变。
+    var systemImage: String {
+        switch self {
+        case .directions: return "dpad"
+        case let .button(button): return button.systemImage
+        }
+    }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .directions: return localization.text("button_mapping.scope.dpad")
+        case let .button(button): return button.displayName(using: localization)
+        }
+    }
+}
+
+extension RemoteButton {
+    /// 按键页卡片的 SF Symbol。键位方案的覆盖名单复用它，避免两处图标对不上。
+    var systemImage: String {
+        switch self {
+        case .power: return "power"
+        case .up: return "chevron.up"
+        case .left: return "chevron.left"
+        case .ok: return "circle.circle"
+        case .right: return "chevron.right"
+        case .down: return "chevron.down"
+        case .back: return "arrow.uturn.backward"
+        case .volumeUp: return "speaker.plus"
+        case .home: return "house"
+        case .volumeDown: return "speaker.minus"
+        case .menu: return "line.3.horizontal"
+        case .tv: return "tv"
+        case .playPause: return "playpause.fill"
+        case .mute: return "speaker.slash"
+        // 这三颗键只属于 Chromecast 遥控器，由它自己的画布渲染；小米画布的卡片集合是
+        // `RemoteButton.xiaomiCases`，不会出现它们，这里只是满足枚举穷尽性。
+        case .youtube, .netflix, .input: return "questionmark"
+        }
+    }
+
+    /// 覆盖名单的展示顺序：电源键在前，方向键随后，其余按按键页的顺序。
+    static let profileScopeDisplayOrder: [RemoteButton] = [
+        .power, .up, .down, .left, .right, .ok, .back, .home, .volumeUp, .volumeDown,
+    ]
+
+    /// 把「允许进键位方案」的按键排成可直接展示的序列。
+    ///
+    /// 名单由私有组件的白名单决定，换遥控器型号就会变，所以界面既不能写死数量，
+    /// 也不能只报数量——旧文案「10 个普通按键」用户根本不知道是哪 10 个。
+    /// 不在 `profileScopeDisplayOrder` 里的按键（Siri Remote 等）追加在末尾，保持不变。
+    static func profileScopeItems(for supported: [RemoteButton]) -> [ButtonProfileScopeItem] {
+        let order = profileScopeDisplayOrder
+        let ordered = order.filter(supported.contains) + supported.filter { !order.contains($0) }
+        let directions: [RemoteButton] = [.up, .down, .left, .right]
+        guard directions.allSatisfy(ordered.contains) else {
+            return ordered.map { .button($0) }
+        }
+        var items: [ButtonProfileScopeItem] = []
+        for button in ordered {
+            if directions.contains(button) {
+                if !items.contains(.directions) {
+                    items.append(.directions)
+                }
+            } else {
+                items.append(.button(button))
+            }
+        }
+        return items
+    }
+}
+
+enum RemoteNativeEvent: Hashable {
+    case keyboard(keyCode: UInt16)
+    case systemKey(type: Int32)
+}
+
+enum RemoteEventEdge: Equatable {
+    case down
+    case up
+}
+
+struct CustomKeyboardShortcut: Codable, Equatable {
+    static let supportedModifiers: NSEvent.ModifierFlags = [
+        .control, .option, .shift, .command, .function,
+    ]
+    private static let leftControlMask = UInt(NX_DEVICELCTLKEYMASK)
+    private static let rightControlMask = UInt(NX_DEVICERCTLKEYMASK)
+    private static let leftOptionMask = UInt(NX_DEVICELALTKEYMASK)
+    private static let rightOptionMask = UInt(NX_DEVICERALTKEYMASK)
+    private static let leftShiftMask = UInt(NX_DEVICELSHIFTKEYMASK)
+    private static let rightShiftMask = UInt(NX_DEVICERSHIFTKEYMASK)
+    private static let leftCommandMask = UInt(NX_DEVICELCMDKEYMASK)
+    private static let rightCommandMask = UInt(NX_DEVICERCMDKEYMASK)
+    private static let controlDeviceModifiers = NSEvent.ModifierFlags(
+        rawValue: leftControlMask | rightControlMask
+    )
+    private static let optionDeviceModifiers = NSEvent.ModifierFlags(
+        rawValue: leftOptionMask | rightOptionMask
+    )
+    private static let shiftDeviceModifiers = NSEvent.ModifierFlags(
+        rawValue: leftShiftMask | rightShiftMask
+    )
+    private static let commandDeviceModifiers = NSEvent.ModifierFlags(
+        rawValue: leftCommandMask | rightCommandMask
+    )
+    private static let deviceModifiers = controlDeviceModifiers
+        .union(optionDeviceModifiers)
+        .union(shiftDeviceModifiers)
+        .union(commandDeviceModifiers)
+
+    let keyCode: UInt16
+    let modifierFlagsRawValue: UInt
+    let keyLabel: String
+
+    init(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags, keyLabel: String) {
+        self.keyCode = keyCode
+        modifierFlagsRawValue = Self.normalizedModifierFlags(
+            keyCode: keyCode,
+            modifierFlags: modifierFlags
+        ).rawValue
+        self.keyLabel = keyLabel
+    }
+
+    init(event: NSEvent) {
+        self.init(
+            keyCode: event.keyCode,
+            modifierFlags: event.modifierFlags,
+            keyLabel: Self.keyLabel(for: event)
+        )
+    }
+
+    var modifierFlags: NSEvent.ModifierFlags {
+        Self.normalizedModifierFlags(
+            keyCode: keyCode,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: modifierFlagsRawValue)
+        )
+    }
+
+    var cgEventFlags: CGEventFlags {
+        var flags: CGEventFlags = []
+        if modifierFlags.contains(.control) { flags.insert(.maskControl) }
+        if modifierFlags.contains(.option) { flags.insert(.maskAlternate) }
+        if modifierFlags.contains(.shift) { flags.insert(.maskShift) }
+        if modifierFlags.contains(.command) { flags.insert(.maskCommand) }
+        if modifierFlags.contains(.function) { flags.insert(.maskSecondaryFn) }
+        flags.formUnion(CGEventFlags(rawValue: UInt64(
+            modifierFlags.intersection(Self.deviceModifiers).rawValue
+        )))
+        return flags
+    }
+
+    var standaloneModifier: StandaloneKeyboardModifier? {
+        StandaloneKeyboardModifier.matching(self)
+    }
+
+    var isMacMicrophoneCombination: Bool {
+        keyCode <= 127 && !StandaloneKeyboardModifier.allCases.contains(where: { $0.keyCode == keyCode }) &&
+            !modifierFlags.intersection([.command, .control, .option]).isEmpty &&
+            !modifierFlags.contains(.function)
+    }
+
+    var isRepeatableNavigationKey: Bool {
+        modifierFlags.isEmpty && ([51, 123, 124, 125, 126] as [UInt16]).contains(keyCode)
+    }
+
+    private static func normalizedModifierFlags(
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> NSEvent.ModifierFlags {
+        var normalized = modifierFlags.intersection(Self.supportedModifiers)
+        if normalized.contains(.control) {
+            normalized.formUnion(modifierFlags.intersection(controlDeviceModifiers))
+        }
+        if normalized.contains(.option) {
+            normalized.formUnion(modifierFlags.intersection(optionDeviceModifiers))
+        }
+        if normalized.contains(.shift) {
+            normalized.formUnion(modifierFlags.intersection(shiftDeviceModifiers))
+        }
+        if normalized.contains(.command) {
+            normalized.formUnion(modifierFlags.intersection(commandDeviceModifiers))
+        }
+        if (123...126).contains(keyCode) {
+            normalized.remove(.function)
+        }
+        return normalized
+    }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        if let standaloneModifier {
+            return standaloneModifier.displayName(using: localization)
+        }
+        var result = ""
+        if modifierFlags.contains(.control) {
+            result += sidedSymbol(
+                "⌃", leftMask: Self.leftControlMask, rightMask: Self.rightControlMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.option) {
+            result += sidedSymbol(
+                "⌥", leftMask: Self.leftOptionMask, rightMask: Self.rightOptionMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.shift) {
+            result += sidedSymbol(
+                "⇧", leftMask: Self.leftShiftMask, rightMask: Self.rightShiftMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.command) {
+            result += sidedSymbol(
+                "⌘", leftMask: Self.leftCommandMask, rightMask: Self.rightCommandMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.function) { result += "fn " }
+        return result + localizedKeyLabel(using: localization)
+    }
+
+    /// Compact macOS-style representation used by the mapping UI.
+    func visualDisplayName(using localization: LocalizationStore) -> String {
+        if let standaloneModifier {
+            return standaloneModifier.symbol
+        }
+        var result = ""
+        if modifierFlags.contains(.control) {
+            result += sidedSymbol(
+                "⌃", leftMask: Self.leftControlMask, rightMask: Self.rightControlMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.option) {
+            result += sidedSymbol(
+                "⌥", leftMask: Self.leftOptionMask, rightMask: Self.rightOptionMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.shift) {
+            result += sidedSymbol(
+                "⇧", leftMask: Self.leftShiftMask, rightMask: Self.rightShiftMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.command) {
+            result += sidedSymbol(
+                "⌘", leftMask: Self.leftCommandMask, rightMask: Self.rightCommandMask,
+                using: localization
+            )
+        }
+        if modifierFlags.contains(.function) { result += "fn " }
+        return result + visualKeyLabel(using: localization)
+    }
+
+    /// Full keyboard wording used by tooltips and accessibility labels.
+    func detailedDisplayName(using localization: LocalizationStore) -> String {
+        if let standaloneModifier {
+            return standaloneModifier.displayName(using: localization)
+        }
+        var parts: [String] = []
+        if modifierFlags.contains(.control) {
+            parts.append(detailedModifierName(
+                "shortcut.modifier.control",
+                leftMask: Self.leftControlMask,
+                rightMask: Self.rightControlMask,
+                using: localization
+            ))
+        }
+        if modifierFlags.contains(.option) {
+            parts.append(detailedModifierName(
+                "shortcut.modifier.option",
+                leftMask: Self.leftOptionMask,
+                rightMask: Self.rightOptionMask,
+                using: localization
+            ))
+        }
+        if modifierFlags.contains(.shift) {
+            parts.append(detailedModifierName(
+                "shortcut.modifier.shift",
+                leftMask: Self.leftShiftMask,
+                rightMask: Self.rightShiftMask,
+                using: localization
+            ))
+        }
+        if modifierFlags.contains(.command) {
+            parts.append(detailedModifierName(
+                "shortcut.modifier.command",
+                leftMask: Self.leftCommandMask,
+                rightMask: Self.rightCommandMask,
+                using: localization
+            ))
+        }
+        if modifierFlags.contains(.function) { parts.append(localization.text("shortcut.modifier.function")) }
+        parts.append(detailedKeyLabel(using: localization))
+        return parts.joined(separator: " + ")
+    }
+
+    private func sidedSymbol(
+        _ symbol: String,
+        leftMask: UInt,
+        rightMask: UInt,
+        using localization: LocalizationStore
+    ) -> String {
+        sidePrefix(leftMask: leftMask, rightMask: rightMask, using: localization) + symbol
+    }
+
+    private func sidePrefix(
+        leftMask: UInt,
+        rightMask: UInt,
+        using localization: LocalizationStore
+    ) -> String {
+        if modifierFlagsRawValue & rightMask != 0 {
+            return localization.text("keyboard.modifier.right")
+        }
+        if modifierFlagsRawValue & leftMask != 0 {
+            return localization.text("keyboard.modifier.left")
+        }
+        return ""
+    }
+
+    private func detailedModifierName(
+        _ localizationKey: String,
+        leftMask: UInt,
+        rightMask: UInt,
+        using localization: LocalizationStore
+    ) -> String {
+        let name = localization.text(localizationKey)
+        let prefix = sidePrefix(leftMask: leftMask, rightMask: rightMask, using: localization)
+        return prefix.isEmpty ? name : "\(prefix) \(name)"
+    }
+
+    private func visualKeyLabel(using localization: LocalizationStore) -> String {
+        switch keyCode {
+        case 36: return "⏎"
+        case 48: return "⇥"
+        case 49: return "␠"
+        case 51: return "⌫"
+        case 53: return "⎋"
+        case 76: return "⌤"
+        case 115: return "Home"
+        case 116: return "Page Up"
+        case 117: return "⌦"
+        case 119: return "End"
+        case 121: return "Page Down"
+        case 123: return "←"
+        case 124: return "→"
+        case 125: return "↓"
+        case 126: return "↑"
+        default:
+            // 空 label 不能渲染成空串：按键页会出现一格空白，看着像没有设置。
+            let trimmed = keyLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.hasPrefix("Key Code ") || trimmed.hasPrefix("键码") {
+                return String(
+                    format: localization.text("keyboard.key_code"),
+                    locale: localization.locale,
+                    arguments: [String(keyCode)]
+                )
+            }
+            return trimmed
+        }
+    }
+
+    private func detailedKeyLabel(using localization: LocalizationStore) -> String {
+        switch keyCode {
+        case 36: return localization.text("keyboard.key.return")
+        case 48: return localization.text("keyboard.key.tab")
+        case 49: return localization.text("keyboard.key.space")
+        case 51: return localization.text("keyboard.key.delete")
+        case 53: return localization.text("keyboard.key.escape")
+        case 76: return localization.text("keyboard.key.enter")
+        case 123: return localization.text("keyboard.key.left")
+        case 124: return localization.text("keyboard.key.right")
+        case 125: return localization.text("keyboard.key.down")
+        case 126: return localization.text("keyboard.key.up")
+        default: return localizedKeyLabel(using: localization)
+        }
+    }
+
+    private func localizedKeyLabel(using localization: LocalizationStore) -> String {
+        switch keyCode {
+        case 36: return localization.text("keyboard.key.return")
+        case 48: return localization.text("keyboard.key.tab")
+        case 49: return localization.text("keyboard.key.space")
+        case 71: return localization.text("keyboard.key.clear")
+        case 76: return localization.text("keyboard.key.enter")
+        case 114: return localization.text("keyboard.key.help")
+        case 115: return localization.text("keyboard.key.home")
+        case 116: return localization.text("keyboard.key.page_up")
+        case 119: return localization.text("keyboard.key.end")
+        case 121: return localization.text("keyboard.key.page_down")
+        default:
+            if keyLabel.hasPrefix("Key Code ") || keyLabel.hasPrefix("键码 ") {
+                return String(
+                    format: localization.text("keyboard.key_code"),
+                    locale: localization.locale,
+                    arguments: [String(keyCode)]
+                )
+            }
+            return keyLabel
+        }
+    }
+
+    private static func keyLabel(for event: NSEvent) -> String {
+        switch event.keyCode {
+        case 36: return "Return"
+        case 48: return "Tab"
+        case 49: return "Space"
+        case 51: return "⌫"
+        case 53: return "Esc"
+        case 64: return "F17"
+        case 71: return "Clear"
+        case 76: return "Enter"
+        case 79: return "F18"
+        case 80: return "F19"
+        case 90: return "F20"
+        case 96: return "F5"
+        case 97: return "F6"
+        case 98: return "F7"
+        case 99: return "F3"
+        case 100: return "F8"
+        case 101: return "F9"
+        case 103: return "F11"
+        case 105: return "F13"
+        case 106: return "F16"
+        case 107: return "F14"
+        case 109: return "F10"
+        case 111: return "F12"
+        case 113: return "F15"
+        case 114: return "Help"
+        case 115: return "Home"
+        case 116: return "Page Up"
+        case 117: return "⌦"
+        case 118: return "F4"
+        case 119: return "End"
+        case 120: return "F2"
+        case 121: return "Page Down"
+        case 122: return "F1"
+        case 123: return "←"
+        case 124: return "→"
+        case 125: return "↓"
+        case 126: return "↑"
+        default:
+            let characters = event.charactersIgnoringModifiers ?? ""
+            return characters.isEmpty ? "Key Code \(event.keyCode)" : characters.uppercased()
+        }
+    }
+}
+
+enum ButtonTrigger: String, CaseIterable, Codable, Identifiable {
+    case singleClick
+    case doubleClick
+    case longPress
+
+    var id: String { rawValue }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .singleClick: return localization.text("trigger.single_click")
+        case .doubleClick: return localization.text("trigger.double_click")
+        case .longPress: return localization.text("trigger.long_press")
+        }
+    }
+}
+
+struct ConfiguredButtonAction: Codable, Equatable {
+    var action: ButtonAction
+    var shortcut: CustomKeyboardShortcut?
+    var applicationProfileID: UUID?
+    var macroID: String?
+
+    init(
+        action: ButtonAction,
+        shortcut: CustomKeyboardShortcut?,
+        applicationProfileID: UUID? = nil,
+        macroID: String? = nil
+    ) {
+        self.action = action
+        self.shortcut = shortcut
+        self.applicationProfileID = applicationProfileID
+        self.macroID = macroID
+    }
+
+    static let disabled = ConfiguredButtonAction(action: .disabled, shortcut: nil)
+
+    /// A custom shortcut without recorded keys cannot run. Reading normalises it to
+    /// "not set" so an unrecorded shortcut is never stored, exported or shown as a binding.
+    var normalizedForExecution: ConfiguredButtonAction {
+        guard action == .customShortcut, shortcut == nil else { return self }
+        return ConfiguredButtonAction(action: .disabled, shortcut: nil)
+    }
+
+    var allowsSingleClickRepeat: Bool {
+        action.allowsRepeat || (action == .customShortcut && shortcut?.isRepeatableNavigationKey == true)
+    }
+
+    var isDirectionalOrDeleteBackward: Bool {
+        action.isDirectionalOrDeleteBackward ||
+            (action == .customShortcut && shortcut?.isRepeatableNavigationKey == true)
+    }
+}
+
+enum CustomApplicationFocusStrategy: String, Codable, CaseIterable, Identifiable {
+    case none
+    case keyboardShortcut
+    case recordedAccessibility
+
+    var id: String { rawValue }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .none: return localization.text("custom_application.focus.none")
+        case .keyboardShortcut: return localization.text("custom_application.focus.shortcut")
+        case .recordedAccessibility: return localization.text("custom_application.focus.recorded")
+        }
+    }
+}
+
+struct NormalizedAccessibilityFrame: Codable, Equatable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+struct AccessibilityFocusTarget: Codable, Equatable {
+    let role: String
+    let identifier: String
+    let title: String
+    let description: String
+    let help: String
+    let placeholder: String
+    let context: String
+    let windowTitle: String
+    let normalizedFrame: NormalizedAccessibilityFrame?
+}
+
+struct CustomApplicationProfile: Codable, Equatable, Identifiable {
+    let id: UUID
+    var displayName: String
+    var bundleIdentifier: String
+    var applicationPath: String
+    var focusStrategy: CustomApplicationFocusStrategy
+    var focusShortcut: CustomKeyboardShortcut?
+    var accessibilityTarget: AccessibilityFocusTarget?
+    /// Separate from `accessibilityTarget` on purpose: the scroll region is not
+    /// an input field (decision S17).
+    var scrollRegionTarget: ScrollRegionTarget?
+
+    init(
+        id: UUID = UUID(),
+        displayName: String,
+        bundleIdentifier: String,
+        applicationPath: String,
+        focusStrategy: CustomApplicationFocusStrategy = .none,
+        focusShortcut: CustomKeyboardShortcut? = nil,
+        accessibilityTarget: AccessibilityFocusTarget? = nil,
+        scrollRegionTarget: ScrollRegionTarget? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.bundleIdentifier = bundleIdentifier
+        self.applicationPath = applicationPath
+        self.focusStrategy = focusStrategy
+        self.focusShortcut = focusShortcut
+        self.accessibilityTarget = accessibilityTarget
+        self.scrollRegionTarget = scrollRegionTarget
+    }
+}
+
+enum ApplicationFocusStrategy: Equatable {
+    case accessibilityComposer
+    case cmuxSurfaceAPI
+}
+
+enum PresetApplication: String, CaseIterable, Identifiable {
+    case remoteMic
+    case codex
+    case workBuddy
+    case claude
+    case cmux
+    case weChat
+    case cursor
+    case xcode
+    case slack
+    case weCom
+    case neteaseMusic
+    case chrome
+    case safari
+    case zed
+    case dimAgent
+
+    var id: String { rawValue }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .remoteMic: return localization.text("app.name")
+        case .codex: return "Codex"
+        case .workBuddy: return "WorkBuddy"
+        case .claude: return "Claude"
+        case .cmux: return "cmux"
+        case .weChat: return localization.text("application.wechat")
+        case .cursor: return "Cursor"
+        case .xcode: return "Xcode"
+        case .slack: return "Slack"
+        case .weCom: return localization.text("application.wecom")
+        case .neteaseMusic: return localization.text("application.netease_music")
+        case .chrome: return "Chrome"
+        case .safari: return "Safari"
+        case .zed: return "Zed"
+        case .dimAgent: return "DimAgent"
+        }
+    }
+
+    var bundleIdentifier: String {
+        switch self {
+        case .remoteMic: return "com.hd838a.RemoteMic"
+        case .codex: return "com.openai.codex"
+        case .workBuddy: return "com.tencent.workbuddy.mac"
+        case .claude: return "com.anthropic.claudefordesktop"
+        case .cmux: return "com.cmuxterm.app"
+        case .weChat: return "com.tencent.xinWeChat"
+        case .cursor: return "com.todesktop.230313mzl4w4u92"
+        case .xcode: return "com.apple.dt.Xcode"
+        case .slack: return "com.tinyspeck.slackmacgap"
+        case .weCom: return "com.tencent.WeWorkMac"
+        case .neteaseMusic: return "com.netease.163music"
+        case .chrome: return "com.google.Chrome"
+        case .safari: return "com.apple.Safari"
+        case .zed: return "dev.zed.Zed"
+        case .dimAgent: return "com.dimcode.app"
+        }
+    }
+
+    var focusStrategy: ApplicationFocusStrategy? {
+        switch self {
+        case .codex, .workBuddy, .claude, .dimAgent: return .accessibilityComposer
+        case .cmux: return .cmuxSurfaceAPI
+        default: return nil
+        }
+    }
+
+    static var installedBundleIdentifiers: Set<String> {
+        var identifiers: Set<String> = [remoteMic.bundleIdentifier]
+        identifiers.formUnion(allCases.compactMap { application in
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: application.bundleIdentifier)
+                .map { _ in application.bundleIdentifier }
+        })
+        return identifiers
+    }
+}
+
+/// 随 App 发布的输入框记录：把已经在真机上验证过的结果内置，用户不需要自己学习。
+///
+/// 与 `ScrollRegionPreset` 平行但完全独立（decision S17）：这里只描述输入框，
+/// 命中后仍走 `focusRecordedAccessibilityTarget` 的记录匹配路径，不新增第二套匹配算法；
+/// 记录匹配失败时继续回退到 composer 启发式扫描，不会因为内置记录挡住原本能用的路径。
+enum AccessibilityFocusPreset {
+    struct Rule {
+        let bundleIdentifier: String
+        let target: AccessibilityFocusTarget
+    }
+
+    static let rules: [Rule] = [
+        Rule(
+            bundleIdentifier: PresetApplication.dimAgent.bundleIdentifier,
+            target: AccessibilityFocusTarget(
+                role: "AXTextArea",
+                identifier: "",
+                title: "",
+                description: "",
+                help: "",
+                placeholder: "",
+                context: "DimAgent",
+                windowTitle: "DimAgent",
+                normalizedFrame: NormalizedAccessibilityFrame(
+                    x: 0.2321285140562249,
+                    y: 0.792803970223325,
+                    width: 0.738152610441767,
+                    height: 0.07568238213399504
+                )
+            )
+        ),
+    ]
+
+    static func target(for bundleIdentifier: String) -> AccessibilityFocusTarget? {
+        rules.first { $0.bundleIdentifier == bundleIdentifier }?.target
+    }
+}
+
+enum ButtonActionCategory: String, CaseIterable, Identifiable {
+    case basicKeys
+    case systemAndMedia
+    case custom
+    /// 「组合动作」和「常用语」一样是独立的动作分类：它的候选来自宏库卡片，
+    /// 不是动作网格里的一项，因此不参与 `ButtonAction` 的逐个列举。
+    case combinations
+    case commonPhrases
+    case applications
+
+    var id: String { rawValue }
+
+    var localizationKey: String {
+        switch self {
+        case .basicKeys: return "button_mapping.action_group.basic_keys"
+        case .systemAndMedia: return "button_mapping.action_group.system_and_media"
+        case .custom: return "button_mapping.action_group.custom"
+        case .combinations: return "action.combination_action"
+        case .commonPhrases: return "common_phrases.title"
+        case .applications: return "button_mapping.action_group.applications"
+        }
+    }
+}
+
+enum ButtonAction: String, CaseIterable, Codable, Identifiable {
+    case disabled
+    case escape
+    case returnKey
+    case commandReturn
+    case shiftReturn
+    case commandCopy
+    case commandPaste
+    case commandClose
+    case commandQuit
+    case commandCut
+    case commandSelectAll
+    case commandUndo
+    case commandRedo
+    case commandFind
+    case commandSave
+    case commandDelete
+    case arrowUp
+    case arrowDown
+    case arrowLeft
+    case arrowRight
+    case scrollUp
+    case scrollDown
+    case pageUp
+    case pageDown
+    case scrollToTop
+    case scrollToBottom
+    case deleteBackward
+    case showDesktop
+    case contextMenu
+    case appSwitcher
+    case volumeUp
+    case volumeDown
+    case volumeMute
+    case playPause
+    case previousCommandLeft
+    case nextCommandRight
+    case customShortcut
+    case combinationAction
+    case focusInput
+    case openCustomApplication
+    case toggleLongRecording
+    case openCommonPhrases
+    case openRemoteMic
+    case openCodex
+    case openWorkBuddy
+    case openClaude
+    case openCmux
+    case openWeChat
+    case openCursor
+    case openXcode
+    case openSlack
+    case openWeCom
+    case openNeteaseMusic
+    case openChrome
+    case openSafari
+    case openZed
+    case openDimAgent
+
+    var id: String { rawValue }
+
+    func displayName(using localization: LocalizationStore) -> String {
+        switch self {
+        case .disabled: return localization.text("action.disabled")
+        case .escape: return localization.text("action.escape")
+        case .returnKey: return localization.text("action.return_key")
+        case .commandReturn: return localization.text("action.command_return")
+        case .shiftReturn: return localization.text("action.shift_return")
+        case .commandCopy: return localization.text("action.command_copy")
+        case .commandPaste: return localization.text("action.command_paste")
+        case .commandClose: return localization.text("action.command_close")
+        case .commandQuit: return localization.text("action.command_quit")
+        case .commandCut: return localization.text("action.command_cut")
+        case .commandSelectAll: return localization.text("action.command_select_all")
+        case .commandUndo: return localization.text("action.command_undo")
+        case .commandRedo: return localization.text("action.command_redo")
+        case .commandFind: return localization.text("action.command_find")
+        case .commandSave: return localization.text("action.command_save")
+        case .commandDelete: return localization.text("action.command_delete")
+        case .arrowUp: return localization.text("action.arrow_up")
+        case .arrowDown: return localization.text("action.arrow_down")
+        case .arrowLeft: return localization.text("action.arrow_left")
+        case .arrowRight: return localization.text("action.arrow_right")
+        case .scrollUp: return localization.text("action.scroll_up")
+        case .scrollDown: return localization.text("action.scroll_down")
+        case .pageUp: return localization.text("action.page_up")
+        case .pageDown: return localization.text("action.page_down")
+        case .scrollToTop: return localization.text("action.scroll_to_top")
+        case .scrollToBottom: return localization.text("action.scroll_to_bottom")
+        case .deleteBackward: return localization.text("action.delete_backspace")
+        case .showDesktop: return localization.text("action.show_desktop")
+        case .contextMenu: return localization.text("action.context_menu")
+        case .appSwitcher: return localization.text("action.app_switcher")
+        case .volumeUp: return localization.text("action.system_volume_up")
+        case .volumeDown: return localization.text("action.system_volume_down")
+        case .volumeMute: return localization.text("action.system_mute")
+        case .playPause: return localization.text("action.play_pause")
+        case .previousCommandLeft: return localization.text("action.previous_command_left")
+        case .nextCommandRight: return localization.text("action.next_command_right")
+        case .combinationAction: return localization.text("action.combination_action")
+        case .customShortcut: return localization.text("action.custom_shortcut")
+        case .focusInput: return localization.text("action.focus_input")
+        case .openCustomApplication: return localization.text("action.open_custom_application")
+        case .openCommonPhrases: return localization.text("action.open_common_phrases")
+        case .toggleLongRecording: return localization.text("action.toggle_long_recording")
+        case .openRemoteMic: return localization.text("action.open_remote_mic")
+        case .openCodex: return localization.text("action.open_codex")
+        case .openWorkBuddy: return localization.text("action.open_workbuddy")
+        case .openClaude: return localization.text("action.open_claude")
+        case .openCmux: return localization.text("action.open_cmux")
+        case .openWeChat: return localization.text("action.open_wechat")
+        case .openCursor: return localization.text("action.open_cursor")
+        case .openXcode: return localization.text("action.open_xcode")
+        case .openSlack: return localization.text("action.open_slack")
+        case .openWeCom: return localization.text("action.open_wecom")
+        case .openNeteaseMusic: return localization.text("action.open_netease_music")
+        case .openChrome: return localization.text("action.open_chrome")
+        case .openSafari: return localization.text("action.open_safari")
+        case .openZed: return localization.text("action.open_zed")
+        case .openDimAgent: return localization.text("action.open_dim_agent")
+        }
+    }
+
+    /// Compact macOS notation used in the button mapping page.
+    ///
+    /// The action's full name remains available for accessibility and hover
+    /// help. This method only changes the resting visual label.
+    func visualDisplayName(using localization: LocalizationStore) -> String {
+        if self == .showDesktop {
+            return displayName(using: localization)
+        }
+        return compactShortcut?.visualDisplayName(using: localization) ?? displayName(using: localization)
+    }
+
+    /// Full shortcut wording used by the button mapping tooltip.
+    func detailedDisplayName(using localization: LocalizationStore) -> String {
+        if self == .showDesktop {
+            return displayName(using: localization)
+        }
+        return compactShortcut?.detailedDisplayName(using: localization) ?? displayName(using: localization)
+    }
+
+    private var compactShortcut: CustomKeyboardShortcut? {
+        switch self {
+        case .escape:
+            return CustomKeyboardShortcut(keyCode: 53, modifierFlags: [], keyLabel: "Esc")
+        case .returnKey:
+            return CustomKeyboardShortcut(keyCode: 36, modifierFlags: [], keyLabel: "Return")
+        case .commandReturn:
+            return CustomKeyboardShortcut(keyCode: 36, modifierFlags: .command, keyLabel: "Return")
+        case .shiftReturn:
+            return CustomKeyboardShortcut(keyCode: 36, modifierFlags: .shift, keyLabel: "Return")
+        case .commandCopy:
+            return CustomKeyboardShortcut(keyCode: 8, modifierFlags: .command, keyLabel: "C")
+        case .commandPaste:
+            return CustomKeyboardShortcut(keyCode: 9, modifierFlags: .command, keyLabel: "V")
+        case .commandClose:
+            return CustomKeyboardShortcut(keyCode: 13, modifierFlags: .command, keyLabel: "W")
+        case .commandQuit:
+            return CustomKeyboardShortcut(keyCode: 12, modifierFlags: .command, keyLabel: "Q")
+        case .commandCut:
+            return CustomKeyboardShortcut(keyCode: 7, modifierFlags: .command, keyLabel: "X")
+        case .commandSelectAll:
+            return CustomKeyboardShortcut(keyCode: 0, modifierFlags: .command, keyLabel: "A")
+        case .commandUndo:
+            return CustomKeyboardShortcut(keyCode: 6, modifierFlags: .command, keyLabel: "Z")
+        case .commandRedo:
+            return CustomKeyboardShortcut(keyCode: 6, modifierFlags: [.shift, .command], keyLabel: "Z")
+        case .commandFind:
+            return CustomKeyboardShortcut(keyCode: 3, modifierFlags: .command, keyLabel: "F")
+        case .commandSave:
+            return CustomKeyboardShortcut(keyCode: 1, modifierFlags: .command, keyLabel: "S")
+        case .commandDelete:
+            return CustomKeyboardShortcut(keyCode: 51, modifierFlags: .command, keyLabel: "Delete")
+        case .arrowUp:
+            return CustomKeyboardShortcut(keyCode: 126, modifierFlags: [], keyLabel: "Up")
+        case .arrowDown:
+            return CustomKeyboardShortcut(keyCode: 125, modifierFlags: [], keyLabel: "Down")
+        case .arrowLeft:
+            return CustomKeyboardShortcut(keyCode: 123, modifierFlags: [], keyLabel: "Left")
+        case .arrowRight:
+            return CustomKeyboardShortcut(keyCode: 124, modifierFlags: [], keyLabel: "Right")
+        case .deleteBackward:
+            return CustomKeyboardShortcut(keyCode: 51, modifierFlags: [], keyLabel: "Delete")
+        case .showDesktop:
+            return CustomKeyboardShortcut(keyCode: 103, modifierFlags: .function, keyLabel: "F11")
+        case .appSwitcher:
+            return CustomKeyboardShortcut(keyCode: 48, modifierFlags: .command, keyLabel: "Tab")
+        default:
+            return nil
+        }
+    }
+
+    var presetApplication: PresetApplication? {
+        switch self {
+        case .openRemoteMic: return .remoteMic
+        case .openCodex: return .codex
+        case .openWorkBuddy: return .workBuddy
+        case .openClaude: return .claude
+        case .openCmux: return .cmux
+        case .openWeChat: return .weChat
+        case .openCursor: return .cursor
+        case .openXcode: return .xcode
+        case .openSlack: return .slack
+        case .openWeCom: return .weCom
+        case .openNeteaseMusic: return .neteaseMusic
+        case .openChrome: return .chrome
+        case .openSafari: return .safari
+        case .openZed: return .zed
+        case .openDimAgent: return .dimAgent
+        default: return nil
+        }
+    }
+
+    var category: ButtonActionCategory {
+        if presetApplication != nil { return .applications }
+        switch self {
+        case .disabled, .escape, .returnKey, .commandReturn, .shiftReturn, .commandCopy,
+             .commandPaste, .commandClose, .commandQuit, .commandCut, .commandSelectAll,
+             .commandUndo, .commandRedo, .commandFind, .commandSave, .commandDelete,
+             .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .scrollUp, .scrollDown,
+             .pageUp, .pageDown, .scrollToTop, .scrollToBottom, .deleteBackward:
+            return .basicKeys
+        case .showDesktop, .contextMenu, .appSwitcher, .volumeUp, .volumeDown, .volumeMute,
+             .playPause, .previousCommandLeft, .nextCommandRight, .toggleLongRecording:
+            return .systemAndMedia
+        case .customShortcut:
+            // 自定义快捷键本质就是"发一个自己录的按键组合"，和固定快捷键同属基础按键。
+            return .basicKeys
+        case .focusInput:
+            return .custom
+        case .combinationAction:
+            return .combinations
+        case .openCommonPhrases:
+            return .commonPhrases
+        case .openCustomApplication:
+            return .applications
+        case .openRemoteMic, .openCodex, .openWorkBuddy, .openClaude, .openCmux, .openWeChat, .openCursor,
+             .openXcode, .openSlack, .openWeCom, .openNeteaseMusic, .openChrome, .openSafari,
+             .openZed, .openDimAgent:
+            return .applications
+        }
+    }
+
+    var allowsRepeat: Bool {
+        ![
+            .customShortcut,
+            .focusInput,
+            // 到边缘是一次性跳转，按住连发没有意义（PRODUCT_SPEC）。
+            .scrollToTop,
+            .scrollToBottom,
+            .openCustomApplication,
+            .commandReturn,
+            .shiftReturn,
+            .commandCopy,
+            .commandPaste,
+            .commandClose,
+            .commandQuit,
+            .commandCut,
+            .commandSelectAll,
+            .commandUndo,
+            .commandRedo,
+            .commandFind,
+            .commandSave,
+            .commandDelete,
+            .previousCommandLeft,
+            .nextCommandRight,
+        ].contains(self) && presetApplication == nil && !isAppInternal
+    }
+
+    /// 翻页要靠辅助功能扫描滚动容器，比行滚动贵得多；按住重复时按更长的间隔执行。
+    var isPageScroll: Bool {
+        self == .pageUp || self == .pageDown
+    }
+
+    var isDirectionalOrDeleteBackward: Bool {
+        [.arrowUp, .arrowDown, .arrowLeft, .arrowRight, .deleteBackward].contains(self)
+    }
+
+    var isAppInternal: Bool {
+        self == .toggleLongRecording || self == .openCommonPhrases
+    }
+
+    func isEnabled(experimentalContinuousRecordingEnabled: Bool) -> Bool {
+        self != .toggleLongRecording || experimentalContinuousRecordingEnabled
+    }
+
+    static func pickerActions(
+        installedBundleIdentifiers: Set<String>,
+        current: ButtonAction,
+        experimentalContinuousRecordingEnabled: Bool
+    ) -> [ButtonAction] {
+        let actions = allCases.filter { action in
+            guard action.isEnabled(
+                experimentalContinuousRecordingEnabled: experimentalContinuousRecordingEnabled
+            ) else {
+                return action == current
+            }
+            guard let application = action.presetApplication else { return true }
+            return installedBundleIdentifiers.contains(application.bundleIdentifier) || action == current
+        }
+        return actions.filter { $0 != .openCustomApplication } +
+            (actions.contains(.openCustomApplication) ? [.openCustomApplication] : [])
+    }
+}
+
+enum RemoteHIDReportParser {
+    static func usages(reportID: UInt32, data: Data) -> Set<UInt16>? {
+        guard reportID == 1 else { return nil }
+        var bytes = Array(data)
+        if bytes.count == 7, bytes.first == UInt8(reportID) {
+            bytes.removeFirst()
+        }
+        guard !bytes.isEmpty, bytes.count.isMultiple(of: 2) else { return nil }
+
+        var result = Set<UInt16>()
+        for index in stride(from: 0, to: bytes.count, by: 2) {
+            let usage = UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8
+            if usage != 0 { result.insert(usage) }
+        }
+        return result
+    }
+}
+
+enum HIDPermissionGate {
+    static func canMonitor(
+        mappingEnabled: Bool,
+        inputMonitoringGranted: Bool,
+        accessibilityGranted: Bool,
+        powerKeySuppressed: Bool
+    ) -> Bool {
+        mappingEnabled && inputMonitoringGranted && accessibilityGranted && powerKeySuppressed
+    }
+
+    static func nextPermissionRequest(
+        mappingEnabled: Bool,
+        voiceFnTapModeEnabled: Bool = false,
+        voiceKeyMode: VoiceKeyMode = .function,
+        inputMonitoringGranted: Bool,
+        accessibilityGranted: Bool
+    ) -> HIDPermissionRequest {
+        guard mappingEnabled || voiceFnTapModeEnabled || voiceKeyMode.requiresAccessibility else {
+            return .none
+        }
+        if mappingEnabled, !inputMonitoringGranted { return .inputMonitoring }
+        if !accessibilityGranted { return .accessibility }
+        return .none
+    }
+}
+
+enum HIDPermissionRequest: Equatable {
+    case none
+    case inputMonitoring
+    case accessibility
+}
