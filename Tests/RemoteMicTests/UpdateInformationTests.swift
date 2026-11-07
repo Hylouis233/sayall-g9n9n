@@ -4,6 +4,15 @@ import Testing
 
 @Suite("Update information")
 struct UpdateInformationTests {
+    @Test(arguments: [false, true])
+    func localPublicG9BuildRequiresSourceUpdates(preview: Bool) {
+        let policy = UpdateCheckPolicy(checksForPreReleaseUpdates: preview, isLocalPublicBuild: true)
+        #expect(!policy.allowsUpstreamUpdates)
+        #expect(!policy.startsUpdaterAutomatically)
+        #expect(!policy.allowsBackgroundUpdatePrompts)
+        #expect(!policy.refreshesAboutInformationOnAppear)
+    }
+
     @Test func stableBuildKeepsAutomaticUpdateChecksAndAboutRefresh() {
         let policy = UpdateCheckPolicy(checksForPreReleaseUpdates: false)
 
